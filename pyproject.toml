@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dream-memory"
+version = "0.5.0"
+description = "Human-editable memory consolidation plugin for AI agents — Obsidian-compatible markdown vault"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Kedarnatha Das BVKS"},
+]
+keywords = ["ai", "memory", "consolidation", "obsidian", "agent", "hermes"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+]
+
+[tool.setuptools.packages.find]
+where = ["source"]
+include = ["*"]
+
+[tool.pytest.ini_options]
+testpaths = ["source/tests"]
+python_files = ["test_*.py"]
+addopts = "-q"

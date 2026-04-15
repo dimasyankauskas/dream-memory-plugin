@@ -1,0 +1,233 @@
+"""Dream Memory Taxonomy — memory type definitions and frontmatter utilities.
+
+Defines the four Dream memory types (user, feedback, project, reference) and
+provides helpers for parsing/rendering YAML frontmatter in markdown files.
+
+Frontmatter schema:
+  type:       str        — one of user|feedback|project|reference
+  created:    str        — ISO-8601 timestamp
+  updated:    str        — ISO-8601 timestamp
+  relevance: float      — 0.0–1.0 decay-weighted relevance score
+  tags:       list[str]  — freeform tags for categorisation
+  source:     str        — session-id that created this memory
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# Memory type definitions
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MemoryTypeSpec:
+    """Specification for a single Dream memory type."""
+    name: str
+    description: str
+    max_lines: int
+    filename_pattern: str  # e.g. "{slug}-{ts}.md"
+
+
+MEMORY_TYPES: Dict[str, MemoryTypeSpec] = {
+    "user": MemoryTypeSpec(
+        name="user",
+        description="Personal facts, preferences, and recurring patterns about the user.",
+        max_lines=50,
+        filename_pattern="{slug}-{ts}.md",
+    ),
+    "feedback": MemoryTypeSpec(
+        name="feedback",
+        description="Correction signals — what went wrong, what to do differently next time.",
+        max_lines=30,
+        filename_pattern="{slug}-{ts}.md",
+    ),
+    "project": MemoryTypeSpec(
+        name="project",
+        description="Project-level context: stack choices, architecture decisions, task state.",
+        max_lines=80,
+        filename_pattern="{slug}-{ts}.md",
+    ),
+    "reference": MemoryTypeSpec(
+        name="reference",
+        description="Reference knowledge — API docs, config snippets, how-tos worth retaining.",
+        max_lines=120,
+        filename_pattern="{slug}-{ts}.md",
+    ),
+}
+
+
+def validate_memory_type(type_str: str) -> bool:
+    """Return True if *type_str* is a valid Dream memory type."""
+    return type_str in MEMORY_TYPES
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter parsing / rendering
+# ---------------------------------------------------------------------------
+
+_FM_DELIM = re.compile(r"^---\s*$", re.MULTILINE)
+
+
+def parse_frontmatter(text: str) -> Dict[str, Any]:
+    """Parse YAML frontmatter from a markdown string.
+
+    Returns a dict of metadata fields.  If no frontmatter block is found,
+    returns an empty dict.  Does *not* validate the schema — callers should
+    do that themselves.
+
+    Backward-compatible defaults for new fields:
+      - ``importance``: defaults to ``relevance`` value (or 0.5 if both absent)
+      - ``forgetting_factor``: defaults to 0.02
+    """
+    text = text.strip()
+    if not text.startswith("---"):
+        return {}
+
+    # Find all --- delimiters on their own line
+    delim_matches = list(_FM_DELIM.finditer(text))
+    if len(delim_matches) < 2:
+        return {}
+
+    # FM block is between first --- and second ---
+    start = delim_matches[0].end()
+    end = delim_matches[1].start()
+    fm_block = text[start:end].strip()
+
+    try:
+        import yaml
+        meta = yaml.safe_load(fm_block)
+        if not isinstance(meta, dict):
+            return {}
+    except ImportError:
+        # Fallback: minimal line-based parsing (no nested structures)
+        meta = _parse_frontmatter_simple(fm_block)
+    except Exception:
+        return {}
+
+    # Backward-compat defaults for new fields
+    if "importance" not in meta:
+        meta["importance"] = meta.get("relevance", 0.5)
+    if "forgetting_factor" not in meta:
+        meta["forgetting_factor"] = 0.02
+
+    return meta
+
+
+def _parse_frontmatter_simple(fm_block: str) -> Dict[str, Any]:
+    """Fallback parser when PyYAML is unavailable.
+
+    Handles simple key: value pairs and key: [list] syntax only.
+    """
+    result: Dict[str, Any] = {}
+    for line in fm_block.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+
+        # Handle list values like "tags: [a, b, c]"
+        if value.startswith("[") and value.endswith("]"):
+            items = [v.strip().strip("'\"") for v in value[1:-1].split(",") if v.strip()]
+            result[key] = items
+        else:
+            # Try numeric
+            try:
+                result[key] = int(value)
+            except ValueError:
+                try:
+                    result[key] = float(value)
+                except ValueError:
+                    result[key] = value
+    return result
+
+
+def render_frontmatter(meta: Dict[str, Any]) -> str:
+    """Render a metadata dict to YAML frontmatter string.
+
+    Produces a ``---``-delimited block suitable for prepending to markdown
+    content.  The output is deterministic: keys are sorted alphabetically.
+    """
+    try:
+        import yaml
+        body = yaml.dump(
+            meta,
+            default_flow_style=False,
+            allow_unicode=True,
+            sort_keys=True,
+        ).rstrip()
+    except ImportError:
+        body = _render_frontmatter_simple(meta)
+
+    return f"---\n{body}\n---\n"
+
+
+def _render_frontmatter_simple(meta: Dict[str, Any]) -> str:
+    """Fallback renderer when PyYAML is unavailable."""
+    lines: List[str] = []
+    for key in sorted(meta.keys()):
+        value = meta[key]
+        if isinstance(value, list):
+            lines.append(f"{key}: [{', '.join(str(v) for v in value)}]")
+        else:
+            lines.append(f"{key}: {value}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Convenience: build a full memory document
+# ---------------------------------------------------------------------------
+
+def make_memory_document(
+    content: str,
+    memory_type: str,
+    tags: Optional[List[str]] = None,
+    source: str = "",
+    relevance: float = 0.5,
+    importance: Optional[float] = None,
+    forgetting_factor: Optional[float] = None,
+) -> str:
+    """Create a complete markdown document with frontmatter.
+
+    Parameters
+    ----------
+    content:
+        The free-text memory body.
+    memory_type:
+        One of user|feedback|project|reference.
+    tags:
+        Optional list of tags.
+    source:
+        Session-id that produced this memory.
+    relevance:
+        Initial relevance score (0–1).
+    importance:
+        Memory importance (0–1). Defaults to *relevance* for backward compat.
+    forgetting_factor:
+        Ebbinghaus decay rate.  Defaults to 0.02 (moderate, ~35-day half-life).
+    """
+    if not validate_memory_type(memory_type):
+        raise ValueError(f"Invalid memory type: {memory_type!r}")
+
+    now = datetime.now(timezone.utc).isoformat()
+    # Backward-compat defaults: importance ← relevance, forgetting ← 0.02
+    effective_importance = importance if importance is not None else relevance
+    effective_forgetting = forgetting_factor if forgetting_factor is not None else 0.02
+    meta = {
+        "type": memory_type,
+        "created": now,
+        "updated": now,
+        "relevance": max(0.0, min(1.0, relevance)),
+        "importance": max(0.0, min(1.0, effective_importance)),
+        "forgetting_factor": max(0.0, effective_forgetting),
+        "tags": tags or [],
+        "source": source,
+    }
+    return render_frontmatter(meta) + "\n" + content.lstrip("\n")

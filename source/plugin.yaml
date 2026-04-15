@@ -1,0 +1,7 @@
+name: dream
+version: 0.1.0
+description: "AutoDream-inspired memory consolidation — structured markdown memories with taxonomy, manifest-based recall, and scheduled 4-phase consolidation."
+hooks:
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write
