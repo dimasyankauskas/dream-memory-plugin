@@ -49,39 +49,55 @@ VALID_MEMORY_TYPES = {"user", "feedback", "project", "reference"}
 # Extraction prompt template
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """You are a memory extraction agent. Analyze the conversation below and extract memories worth persisting.
+_SYSTEM_PROMPT = """You are a memory extraction agent. Analyze the conversation and extract memories that will be USEFUL IN FUTURE SESSIONS.
 
 ## Memory Types
 
-Write each memory with the most appropriate type:
-- **user**: Preferences, communication style, goals, personal context (e.g., "User prefers short confirmations over explanations")
-- **feedback**: Corrections, "don't do this again" directives, explicit instructions (e.g., "Don't use markdown tables in Telegram")
-- **project**: Active project facts, technical decisions, architecture choices (e.g., "Dream plugin vault_path defaults to ~/.hermes/dream_vault")
-- **reference**: Stable facts — paths, URLs, API details, tool quirks (e.g., "Obsidian vault is at ~/apps/Garuda_hermes/ObsidianVault/")
+- **user**: Preferences, communication style, goals, personal context. Must be SPECIFIC and ACTIONABLE.
+  Good: "Dimas prefers short confirmations — just 'Updated' or 'Done'"
+  Bad: "User has preferences about communication"
+- **feedback**: Corrections, "don't do this again" directives, explicit instructions.
+  Good: "Don't use markdown tables in Telegram — use code blocks instead"
+  Bad: "User gave feedback about formatting"
+- **project**: Active project facts, technical decisions, architecture choices.
+  Good: "Dream plugin vault_path defaults to ~/.hermes/dream_vault"
+  Bad: "There is a dream plugin project"
+- **reference**: Stable facts — paths, URLs, API details, tool quirks.
+  Good: "Obsidian vault is at ~/apps/Garuda_hermes/ObsidianVault/"
+  Bad: "There is an Obsidian vault somewhere"
 
-## What NOT to Save
-- Greetings, acknowledgments, small talk
+## What NOT to Save (CRITICAL — filter aggressively)
+
+- Greetings, acknowledgments, small talk, "I love it", "looks good"
 - Already-known information (check existing memories below)
-- Transient/ephemeral details (current time, session IDs)
-- Verbose conversation — extract the INSIGHT, not the exchange
+- Transient details (current time, session IDs, temporary states)
+- Vague or generic statements that could apply to anyone
+- Opinions not expressed as actionable preferences ("I think X is interesting" = SKIP)
+- Partial or ambiguous observations ("We discussed architecture" = SKIP)
 - Raw voice transcription artifacts (incomplete sentences, filler words)
-- Subjective opinions not expressed as preferences
+- ANY memory you cannot phrase as a specific, actionable fact
+
+## Quality Test (apply to EVERY extracted memory)
+
+Before extracting, ask: "If I recalled this in a future session with no other context,
+would it change how I act?" If NO, do NOT extract it.
 
 ## Rules
-- Extract INSIGHTS, not raw sentences. "I love it" → "User approves of this approach" or better yet, what specifically they approved
-- Each memory should be self-contained and understandable without the conversation context
-- Use concise, factual language
-- Assign relevance: 0.7-0.9 for preferences/corrections, 0.5-0.7 for project facts, 0.3-0.5 for references
-- Assign tags: 1-3 short lowercase tags per memory
+- Extract INSIGHTS, not sentences. "I love it" is NOT a memory — what specifically did they approve?
+- Each memory must be self-contained and independently understandable
+- Be SPECIFIC: include tool names, exact paths, exact preferences, precise constraints
+- Be CONCISE: one clear fact per memory, under 120 chars preferred
+- Assign relevance: 0.8-0.9 for preferences/corrections, 0.5-0.7 for project facts, 0.3-0.5 for references
+- Assign tags: 2-4 specific lowercase tags (NOT generic like "general" or "discussion")
 - Return valid JSON only — no markdown code fences, no commentary
 
 ## Output Format
 
 Return a JSON object with a single "memories" array. Each entry has:
 - type: one of "user", "feedback", "project", "reference"
-- content: concise, self-contained fact string
-- tags: array of 1-3 short lowercase strings
-- relevance: float between 0.0 and 1.0
+- content: concise, specific, actionable fact string (under 120 chars)
+- tags: array of 2-4 specific lowercase strings
+- relevance: float between 0.3 and 1.0
 
 Example:
 ```json
@@ -90,12 +106,20 @@ Example:
     {
       "type": "feedback",
       "content": "User prefers short confirmations — just 'Updated' or 'Done', no long explanations",
-      "tags": ["preference", "communication"],
+      "tags": ["preference", "communication", "style"],
       "relevance": 0.8
+    },
+    {
+      "type": "project",
+      "content": "Dream plugin uses 4-phase consolidation: orient→gather→consolidate→prune",
+      "tags": ["dream", "architecture", "consolidation"],
+      "relevance": 0.6
     }
   ]
 }
 ```
+
+When in doubt, extract FEWER memories rather than more. 3 high-quality memories beat 10 vague ones.
 """
 
 _USER_PROMPT_TEMPLATE = """## Existing Memories

@@ -223,6 +223,10 @@ class DreamStore:
             type_dir = self._dream_root / type_name
             type_dir.mkdir(exist_ok=True)
 
+        # proposals/ lives alongside the four type directories
+        proposals_dir = self._dream_root / "proposals"
+        proposals_dir.mkdir(exist_ok=True)
+
         # Init manifest if absent
         manifest_path = self._dream_root / _MANIFEST_FILE
         if not manifest_path.exists():
@@ -313,6 +317,88 @@ class DreamStore:
 
         logger.debug("Dream: created %s", filepath)
         return filepath
+
+    # -- Proposals -----------------------------------------------------------
+
+    def get_proposal_path(self, filename: str) -> Path:
+        """Resolve the full path for a proposal file in the proposals/ directory."""
+        if not filename.endswith(".md"):
+            filename += ".md"
+        return self._dream_root / "proposals" / filename
+
+    def add_proposal(
+        self,
+        title: str,
+        body: str,
+        confidence: float,
+        tags: Optional[List[str]] = None,
+        related_memory_refs: Optional[List[str]] = None,
+        source: str = "",
+        importance: float = 0.5,
+        relevance: float = 0.5,
+        forgetting_factor: Optional[float] = None,
+    ) -> Path:
+        """Add a proposal memory to the vault.
+
+        Proposals are written to ``proposals/`` (not a type subdirectory) and
+        tracked in the manifest with ``memory_type: proposal``. The body should
+        include the full proposal content structured as:
+        ``## What I noticed\\n...\\n## Evidence\\n...\\n## Recommendation\\n...``
+
+        Returns the Path to the created file.
+        """
+        effective_forgetting = forgetting_factor if forgetting_factor is not None else 0.01
+        slug = slugify(title, max_words=4)
+        ts = _timestamp_str()
+        suffix = "".join(random.choices(_string_module.ascii_lowercase + _string_module.digits, k=4))
+        filename = f"{slug}-{ts}-{suffix}.md"
+
+        # Build content with header for context
+        content = f"## {title}\n\n{body}"
+
+        doc = make_memory_document(
+            content=content,
+            memory_type="proposal",
+            tags=tags or [],
+            source=source,
+            relevance=relevance,
+            importance=importance,
+            forgetting_factor=effective_forgetting,
+        )
+
+        # Extra frontmatter fields for proposals (stored in frontmatter dict, not render args)
+        meta = parse_frontmatter(doc)
+        meta["confidence"] = confidence
+        if related_memory_refs:
+            meta["related_memories"] = related_memory_refs
+
+        filepath = self.get_proposal_path(filename)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        filepath.write_text(doc, encoding="utf-8")
+
+        # Update manifest
+        self._add_manifest_entry(
+            "proposal", filename, content, tags or [], source,
+            relevance, importance, effective_forgetting,
+        )
+
+        logger.debug("Dream: created proposal %s", filepath)
+        return filepath
+
+    def read_proposal(self, filename: str) -> Dict[str, Any]:
+        """Read and parse a proposal file.
+
+        Returns a dict with ``meta`` (frontmatter dict), ``body`` (content
+        below the frontmatter), and ``path`` (string path).
+        """
+        filepath = self.get_proposal_path(filename)
+        if not filepath.exists():
+            raise FileNotFoundError(f"Proposal not found: {filepath}")
+
+        text = filepath.read_text(encoding="utf-8")
+        meta = parse_frontmatter(text)
+        body = self._extract_body(text)
+        return {"meta": meta, "body": body, "path": str(filepath)}
 
     # -- Read ---------------------------------------------------------------
 
