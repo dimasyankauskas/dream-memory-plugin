@@ -1,518 +1,201 @@
-# 🧠 Dream Memory Plugin for Hermes
+# Dream v2 — Agent Memory That Remembers Why
 
-> **⚠️ STATUS: ACTIVE** — Dream v2 is running as the primary memory provider for Hermes Agent.
+**Dream v2** is a memory provider plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It gives the agent a persistent self-model — the accumulated record of what it learned about itself, about the user, and about the work. Sessions don't start blank anymore.
 
-Dream Memory is an **Obsidian-backed session memory consolidation** system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It extracts structured memories from conversations, organizes them by taxonomy, and periodically consolidates them to prevent vault bloat.
-
-**Live at:** [dimasyankauskas/dream-memory-plugin](https://github.com/dimasyankauskas/dream-memory-plugin)
-
-[![Tests](https://img.shields.io/badge/tests-596%20passing-brightgreen)](./source/tests)  [![Python](https://img.shields.io/badge/python-3.11+-blue)](https://python.org)  [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+This isn't a vector database. It's not an embedding store. It's a flat-file consciousness layer with a manifest and a grep.
 
 ---
 
-## Why Dream Memory (Paused)?
+## What it does
 
-AI agents suffer from two problems:
+Every session ends. Dream extracts what **matters** — not a transcript, not a log — the signal. It stores those memories in a plain-text vault organized by type. The next session, the agent can recall them on demand.
 
-1. **AI Amnesia** — Every session starts blank. The agent forgets your preferences, corrections, and project context.
-2. **Token Bloat** — Dumping full conversation logs into context is expensive and noisy.
+That's it. No embeddings. No RAG pipeline. No consolidation that requires an LLM to run.
 
-Dream Memory fixes both. Inspired by how human sleep consolidates memories, it runs a background consolidation pipeline that **audits, merges, deduplicates, and prunes** memories — compressing scattered notes into clean, structured, connected insights.
-
-The result: your agent **remembers you** across sessions, stays accurate over months, and its knowledge compounds over time.
+The vault is just markdown files and a JSON manifest. Open it in any text editor. Edit anything by hand. Dream never overwrites a memory you touched.
 
 ---
 
-## Features
+## Why v2
 
-### 🏥 Four-Phase Consolidation Pipeline
+v1 had four problems that killed it in production:
 
-Runs automatically on cron (default: 3am daily) or on-demand via `dream_consolidate`:
+1. **Chronicle trap** — extraction wrote "what happened" instead of "what matters." Session dumps, not insights.
+2. **Wikilink explosion** — consolidation tried to cross-link every memory by shared tags. Eighty links per file. Graph untraversable.
+3. **No significance gate** — LLM extracted everything. ~240 memories per week vs. a target of 15–20.
+4. **Vault bloat** — with no line cap and no dedup, the vault grew until it was slower to query than to just forget.
 
-| Phase | Action | Result |
-|-------|--------|--------|
-| **Orient** | Audit vault for fragmentation signals | Detects when consolidation is needed |
-| **Gather** | Group entries by topic, find duplicates/overlaps | Identifies merge candidates |
-| **Consolidate** | Merge duplicates, resolve contradictions | Compresses 10 scattered notes → 1 clear memory |
-| **Prune** | Remove superseded, stale, or redundant entries | Vault stays small and accurate |
-
-### 🏷️ Structured Taxonomy
-
-Four memory types with priority-weighted recall:
-
-| Type | Purpose | Recall Priority |
-|------|---------|----------------|
-| **`user`** | Preferences, communication style, identity | Medium |
-| **`feedback`** | Corrections, "don't do this again" directives | **Highest** |
-| **`project`** | Active projects, code paths, architecture decisions | Medium |
-| **`reference`** | Stable facts — APIs, tool quirks, conventions | Low |
-
-Feedback memories always surface first. Your corrections override everything.
-
-### 🔗 Wikilink Knowledge Graph
-
-After consolidation, memories that share tags get connected with `[[wikilinks]]` — just like Obsidian:
-
-```markdown
-## Related
-
-- [[my-recommendati-set-some-sort-20260414T063313Z-tjix]] — shares: preference, approach
-- [[when-you-stop-working-for-the-day-20260414T030041Z-w9us]] — shares: correction
-```
-
-Links are **cross-type** — a `feedback` correction links to the `project` it applies to. This produces emergent insight: connecting a project decision to a user preference to a past correction.
-
-**Post-pruning safety**: Wikilinks only point to *surviving* memories. No dangling references.
-
-### ⚡ Auto-Recall (Passive Memory Injection)
-
-Relevant memories are **automatically injected into every conversation turn** — no manual `dream_recall` calls needed.
-
-```
-config.yaml:
-  plugins:
-    dream:
-      auto_recall: true        # enable passive injection
-      auto_recall_budget: 2048  # max bytes per turn
-      auto_recall_top_k: 10    # candidates considered
-```
-
-- Feedback-type memories score highest (your corrections come first)
-- Recent and frequently-accessed memories get boosted scores
-- Respects budget — won't flood context
-
-### 📉 Forgetting Curves
-
-Memories that aren't accessed gradually decay in score — just like human memory:
-
-- Frequently-recalled memories get **stronger** (access count boosts recall score)
-- One-off mentions naturally **fade** over time
-- The vault self-optimizes without manual cleanup
-
-### 🤖 LLM-Powered Extraction
-
-Inspired by Anthropic's AutoDream, Dream uses a **forked LLM agent** to extract memories at session end — not regex pattern matching.
-
-**How it works:**
-
-When a session ends, the full conversation transcript is sent to an LLM with a carefully designed extraction prompt. The LLM:
-
-1. Reads the conversation for insights worth persisting
-2. Checks existing memories (manifest summary) to avoid duplicates
-3. Extracts **structured memories** — not raw sentence fragments — with the right taxonomy type, tags, and relevance score
-4. Returns clean, self-contained facts that are understandable without context
-
-**Two extraction modes:**
-
-| Mode | Per-turn (`sync_turn`) | Session-end (`on_session_end`) | Quality |
-|------|----------------------|-------------------------------|---------|
-| **`regex`** | Fast regex patterns | Regex scan of all messages | Low — captures raw sentences |
-| **`llm`** *(default)* | No per-turn extraction | LLM analyzes full conversation | **High — captures insights** |
-| **`both`** | Fast regex patterns | Both regex + LLM, merged & deduped | Highest coverage |
-
-Regex extraction is fast and free (zero API cost, zero latency). LLM extraction costs one API call per session but produces dramatically better memories: "I love it" → "User approves of this approach and wants to continue."
-
-**Graceful fallback**: If `extraction_mode=llm` but no API key is configured or the LLM call fails, the system silently falls back to regex extraction — no session is ever lost.
-
-### 🔒 Consolidation Lock
-
-Prevents race conditions — two consolidation runs can't overlap. If cron triggers while a manual run is active, it waits or skips gracefully.
-
-### 🏠 Human-Editable Markdown Vault
-
-Every memory is a plain markdown file with YAML frontmatter:
-
-```markdown
----
-type: feedback
-tags: [correction, job-search]
-access_count: 5
-created: 2026-04-14T03:00:41Z
-score: 0.55
----
-
-Never mark a job CLOSED from one ATS alone. Ground truth = company's own /careers page first.
-```
-
-Open any text editor — see and edit what your agent remembers. Full transparency, full control.
-
-**Standalone by default.** The vault is a self-contained Obsidian-compatible directory — open it as its own Obsidian vault, or integrate it into your existing vault for unified graph view.
+v2 started from the wreckage. Stripped wikilinks. Removed LLM consolidation entirely. Added a per-session cap of 3 memories. Built a deterministic dedup/merge pipeline that runs without an API call.
 
 ---
 
 ## Architecture
 
 ```
-dream-memory-plugin/
-├── __init__.py          # DreamMemoryProvider — MemoryProvider ABC implementation
-├── store.py            # DreamStore — vault filesystem operations + manifest
-├── taxonomy.py         # Memory types, type validation, display names
-├── extract.py          # Fast regex extraction (per-turn, sync_turn)
-├── extract_llm.py      # LLM-powered extraction (session-end, quality path)
-├── recall.py           # RecallEngine — manifest-based retrieval with scoring
-├── consolidation.py    # 4-phase consolidation pipeline + wikilink generation
-├── shared.py           # Config resolution, shared utilities
-├── cli.py              # /dream CLI command (planned)
-├── plugin.yaml         # Plugin metadata and hooks
-└── tests/              # 596 tests across 15 test suites
-    ├── test_auto_recall.py
-    ├── test_candidate_extraction.py
-    ├── test_consolidation.py
-    ├── test_consolidation_lock.py
-    ├── test_cron.py
-    ├── test_extract_llm.py
-    ├── test_forgetting_curves.py
-    ├── test_llm_consolidation.py
-    ├── test_provider.py
-    ├── test_recall.py
-    ├── test_regression.py
-    ├── test_session_gate.py
-    ├── test_store.py
-    ├── test_taxonomy.py
-    └── test_wikilinks.py
+vault/
+├── consciousness/
+│   ├── self/           ← what the agent learned about itself
+│   ├── relationship/   ← what the agent learned about the user
+│   └── work/           ← project learnings, tactical decisions
+├── decisions/          ← explicit agreements made in a session
+├── feedback/           ← corrections and directives
+├── reference/          ← stable facts: API quirks, paths, tools
+├── staging/            ← pre-compress JSONL rescue (Hermes upstream workaround)
+├── manifest.json       ← single source of truth for recall scoring
+└── MEMORY.md           ← lightweight index for system prompt injection
 ```
 
-### Data Flow
+**Extraction:** At session end, `on_session_end()` sends the transcript to the LLM with a distillation prompt that explicitly asks "what matters" and enforces a significance gate. Maximum 3 memories per session.
 
-```
-User sends message
-       │
-       ▼
-  ┌─────────────┐     ┌──────────────────┐
-  │ Memory Write │────▶│ Candidate Extract │  (on_session_end, on_pre_compress hooks)
-  └─────────────┘     └────────┬─────────┘
-                               │
-                               ▼
-                      ┌─────────────────┐
-                      │   Dream Vault    │  (markdown files + manifest.json)
-                      └────────┬────────┘
-                               │
-                ┌──────────────┼───────────────┐
-                │              │               │
-                ▼              ▼               ▼
-         ┌──────────┐  ┌───────────┐  ┌──────────────┐
-         │ Auto-Recall│  │ dream_recall│  │ Consolidation│
-         │ (passive)  │  │  (explicit) │  │   (cron/on-demand)│
-         └──────────┘  └───────────┘  └──────────────┘
-                │              │               │
-                └──────────────┴───────────────┘
-                               │
-                               ▼
-                      Injected into agent context
-```
+**Pre-compress rescue:** Hermes upstream silently discards `on_pre_compress()` return values. Dream v2 works around this by writing candidates to `staging/*.jsonl`. On next `initialize()`, they merge into the vault. Bug #7192, still open.
+
+**Discord routing:** Memories carry their source context — `discord:thread:parent:thread`, `discord:group:channel`, `discord:dm:user`. Parsed from `gateway_session_key` during provider initialization. Non-Discord sessions use `cli:default` or the platform name.
+
+**Recall:** Manifest-based scoring — tag overlap (35%), importance (25%), recency (15%), access count (15%) — with Ebbinghaus forgetting curve decay applied. No vector search. No external dependencies.
 
 ---
 
-## Installation
+## What v2 does NOT do
 
-### As a Hermes Plugin
+- No wikilinks. Removed entirely. If you want cross-references, use `dream_recall` and read the manifest.
+- No LLM consolidation. The consolidation pipeline dedups, merges duplicates, and enforces line caps. No generative merge step.
+- No auto-recall by default. `auto_recall: false` means Dream stays silent until explicitly queried. On-demand only.
+- No per-turn extraction. `sync_turn()` is a no-op. Extraction happens once, at session end.
 
-Dream Memory is a **built-in memory provider** for [Hermes Agent](https://github.com/nichenqin/hermes-agent). It ships with the agent — no separate installation needed.
+---
 
-### Configuration
+## Setup
 
-Add to `~/.hermes/config.yaml`:
+### 1. Symlink into Hermes plugins directory
+
+```bash
+ln -sf /path/to/dream-memory-plugin/source ~/.hermes/hermes-agent/plugins/memory/dream_v2
+```
+
+### 2. Configure in `~/.hermes/config.yaml`
 
 ```yaml
 memory:
-  provider: dream          # Enable Dream Memory (default: honcho or basic)
+  provider: dream_v2
 
 plugins:
-  dream:
-    # ─── Vault Location ───────────────────────────────────────
-    # Default:  standalone vault at $HERMES_HOME/dream_vault
-    #           (~/.hermes/dream_vault/) — own .obsidian/ config included
-    # Obsidian: point vault_path at your existing Obsidian vault,
-    #           set vault_subdir to a folder name (e.g. "dream")
-    #           memories live at vault_path/vault_subdir/
-    # Custom:   any absolute path you choose
-    #
-    # vault_path: ~/apps/Garuda_hermes/ObsidianVault   # Obsidian integration
-    # vault_subdir: dream                                # Subfolder inside vault_path
-    # ──────────────────────────────────────────────────────────
-    max_lines: 100                       # Per-memory line limit
-    max_bytes: 50000                     # Per-memory byte limit
-    auto_recall: true                    # Passive memory injection every turn
-    auto_recall_budget: 2048             # Max bytes injected per turn
-    auto_recall_top_k: 10               # Candidates considered per recall
-    taxonomy: true                       # Organize vault by type subdirs
-    extraction_mode: llm                # regex | llm (default) | both
-    extraction_model: ""                # LLM model for extraction (empty = uses consolidate_model or default)
-    # extraction_api_key: ""            # API key (default: falls back to consolidate_api_key, then env vars)
-    # extraction_base_url: ""          # Base URL (default: falls back to consolidate_base_url, then env vars)
-    consolidate_cron: "0 3 * * *"       # Cron schedule for consolidation
+  dream_v2:
+    vault_path: /Users/atma/apps/Garuda_hermes/dream
+    extraction_model: glm-5.1:agentic
+    extraction_mode: llm
+    hybrid_mode: true
+    max_memories_per_session: 3
+    significance_threshold: 0.7
 ```
 
-#### Vault Architecture — Standalone vs. Integrated
+`vault_path` defaults to `~/.hermes/dream_v2` if omitted.
 
-Dream Memory supports two vault modes:
-
-**🧊 Standalone (default — zero config)**
-
-```
-~/.hermes/dream_vault/              ← Own Obsidian vault, opened separately
-├── .obsidian/                      ← Independent Obsidian config
-│   └── app.json
-├── user/
-├── feedback/
-├── project/
-├── reference/
-├── manifest.json
-└── consolidation_log.json
-```
-
-- No configuration needed — works out of the box
-- Opens as its own Obsidian vault (File → Open Vault)
-- Self-contained — plugin owns the entire directory
-- Portable — share or version the vault independently
-- Best for: new users, standalone deployments, testing
-
-**🔷 Obsidian-Integrated (set `vault_path`)**
-
-```
-YourObsidianVault/                  ← Your existing Obsidian vault
-├── research/                       ← Your curated notes
-├── projects/                       ← Your curated notes
-├── frameworks/                     ← Your curated notes
-└── dream/                          ← Plugin-managed (vault_subdir: dream)
-    ├── user/
-    ├── feedback/
-    ├── project/
-    ├── reference/
-    ├── manifest.json
-    └── consolidation_log.json
-```
-
-- Dream memories appear in your existing Obsidian graph view
-- Wikilinks connect AI memories to your research and project notes
-- Plugin only manages files inside `dream/` — never touches your other notes
-- One Obsidian window, one knowledge base, one search
-- Best for: power users who want AI memories connected to their existing knowledge graph
-
-| Setup | `vault_path` | `vault_subdir` | Where memories live |
-|-------|-------------|---------------|-------------------|
-| **Standalone** (default) | *(omit)* | *(omit)* | `~/.hermes/dream_vault/` |
-| **Obsidian-Integrated** | `/path/to/ObsidianVault` | `dream` | `ObsidianVault/dream/` |
-| **Custom** | Any absolute path | *(optional)* | `vault_path/vault_subdir/` |
-
-### Standalone Usage
-
-Dream Memory can also be used independently:
-
-```python
-from dream.store import DreamStore
-from dream.recall import RecallEngine
-from dream.consolidation import run_consolidation
-
-# Initialize
-store = DreamStore(vault_path=Path("~/.dream_vault"))
-store.initialize()
-
-# Write a memory
-store.write("user", "Prefers short confirmations", tags=["preference", "communication"])
-
-# Recall
-engine = RecallEngine(store)
-results = engine.recall("communication style", limit=5)
-for r in results:
-    print(f"[{r.score:.2f}] {r.memory_type}: {r.content[:80]}")
-
-# Consolidate (run on cron)
-report = run_consolidation(store, dry_run=False)
-print(f"Merged {report['consolidate']['merged']}, Pruned {report['prune']['deleted_files']}")
-```
-
----
-
-## API Reference
-
-### Tools (Exposed to Agent)
-
-| Tool | Description |
-|------|-------------|
-| `dream_status` | Show vault statistics — count per type, total memories, vault path |
-| `dream_recall` | Recall memories by query (manifest-based, no vector search) |
-| `dream_consolidate` | Trigger consolidation pipeline (Orient → Gather → Consolidate → Prune) |
-
-### MemoryProvider Methods
-
-| Method | Description |
-|--------|-------------|
-| `write(type, content, tags)` | Write a memory to the vault |
-| `read(limit)` | Read recent memories |
-| `should_auto_recall()` | Check if passive injection is enabled |
-| `prefetch(query, session_id, budget)` | Get formatted context block for injection |
-| `system_prompt_block()` | Generate vault status for system prompt |
-
-### Consolidation Pipeline
-
-```python
-from dream.consolidation import run_consolidation
-
-report = run_consolidation(store, dry_run=False)
-# Returns:
-# {
-#   "orient": {"needs_consolidation": True, "reason": "..."},
-#   "gather": {"entries_loaded": N, "groups_found": G, "duplicates_found": D},
-#   "consolidate": {"total_actions": A, "merged": M, "deduped": D},
-#   "prune": {"deleted_files": X, "capped_files": C}
-# }
-```
-
----
-
-## Comparison
-
-| Feature | Dream Memory | Vector DBs (Pinecone, Weaviate) | Basic JSON Store |
-|---------|-------------|-------------------------------|-------------------|
-| **Human-readable** | ✅ Plain markdown | ❌ Embeddings only | ✅ JSON |
-| **Human-editable** | ✅ Any text editor | ❌ Requires API | ⚠️ Requires dev tools |
-| **Obsidian-native** | ✅ `vault_path` integration | ❌ | ❌ |
-| **Consolidation** | ✅ 4-phase pipeline | ❌ Manual | ❌ None |
-| **Deduplication** | ✅ Automatic | ❌ Manual | ❌ None |
-| **Knowledge graph** | ✅ Wikilinks | ❌ Vector proximity only | ❌ None |
-| **Forgetting curves** | ✅ Access-based decay | ❌ Static scores | ❌ None |
-| **Zero dependencies** | ✅ Stdlib only | ❌ Requires DB server | ✅ |
-| **Cross-type connections** | ✅ Feedback → Project | ❌ Flat embeddings | ❌ |
-| **Configurable vault** | ✅ Default, Obsidian, or custom | ❌ Fixed endpoint | ❌ Fixed path |
-
----
-
-## Design Principles
-
-1. **Markdown-first** — Memories are human-readable, human-editable markdown files. No binary formats, no API locks.
-2. **Manifest-based recall** — Frontmatter scanning, not vector search. Zero dependencies, instant startup.
-3. **Feedback priority** — Corrections and directives always surface first. The agent learns from its mistakes.
-4. **Compound intelligence** — Wikilinks create growing connections. The longer you use it, the smarter it gets.
-5. **Graceful decay** — Forgetting curves prevent vault bloat. Stale trivia fades. Reinforced memories strengthen.
-6. **Consolidation safety** — Locking prevents race conditions. Post-pruning wikilinks prevent dangling references.
-7. **Zero dependencies** — Pure Python stdlib. No database, no embedding model, no server.
-
----
-
-## Testing
+### 3. Restart the gateway
 
 ```bash
-# Run all 526 tests
-pytest source/tests/ -v
+hermes gateway stop && hermes gateway start
+```
 
-# Run specific test suite
-pytest source/tests/test_auto_recall.py -v
-pytest source/tests/test_consolidation.py -v
-pytest source/tests/test_wikilinks.py -v
+### 4. Verify
 
-# Run with coverage
-pytest source/tests/ --cov=dream --cov-report=html
+```
+hermes memory status
 ```
 
 ---
 
-## Roadmap
+## Tools
 
-### Completed
-- [x] **LLM-powered extraction** — Anthropic AutoDream-style forked LLM agent for session-end memory extraction
-- [x] **Cron integration** — Automatic nightly consolidation via Hermes scheduler (3am daily)
-- [x] **Obsidian integration** — vault_path + vault_subdir for Obsidian-native vault
-- [x] **Forgetting curves** — Ebbinghaus retention scoring with access-based decay
-- [x] **Consolidation lock** — PID-based prevents concurrent consolidation runs
-- [x] **Session count gate** — Dual-gate: 24h AND ≥5 sessions before consolidation
-- [x] **Wikilinks removed** — v2 intentionally has no wikilinks; consolidation is deterministic markdown processing
-- [x] **Deterministic consolidation** — Consolidation pipeline rewritten; no LLM merge step, no wikilink generation
-- [x] **Per-session memory cap (max 3)** — Significance gate + cap prevents vault bloat
-- [x] **Pre-compress staging rescue** — JSONL staging via `staging.py` works around Hermes upstream bug #7192
-- [x] **Discord context tracking** — Memories tagged with `discord:thread:parent:thread`, `discord:group:channel`, or `discord:dm:user`
+| Tool | What it does |
+|------|-------------|
+| `dream_status` | Vault stats — count per type, total memories, session extraction count |
+| `dream_recall` | Query the manifest. Returns scored memories with content snippets. |
+| `dream_consolidate` | Run the deterministic pipeline: audit → dedup → merge → prune → rebuild index |
 
-### Future
-- [ ] **NREM/REM two-phase** — Deep consolidation (NREM) + creative association (REM)
-- [ ] **LoCoMo benchmark** — Long-term conversation memory evaluation
-- [ ] **`/dream` CLI command** — Interactive consolidation from terminal
+All three are available to the agent as function-calling tools. The agent can invoke them mid-conversation without any external setup.
 
 ---
 
-## 🔬 Resurrection Research
+## Extraction Model
 
-**Date:** 2026-04-19
-**Status:** Paused — root causes identified, solution TBD
+Default: `glm-5.1:agentic` via Ollama. Any OpenAI-compatible endpoint works — set `extraction_base_url` and `api_key` in config.
 
-### What Broke
-
-5 days of live data (171 memories, 9 consolidation runs):
-
-| Problem | Evidence |
-|---------|----------|
-| Consolidation does nothing | 9 runs, all returned `merged=0 pruned=0` |
-| Wikilink explosion | 80+ wikilinks per feedback file — graph untraversable |
-| Chronicle trap | Largest file = 459-line session dump, not insight |
-| 26x too many memories | ~240/week vs target 15-20/week |
-| Hermes `on_pre_compress` bug | ALL memory plugins silently discard insights on context compression (upstream bug #7192) |
-
-### Root Causes
-
-1. **Wikilinks are anti-productive** — Every memory links to 30-80 others, making consolidation exponentially expensive
-2. **LLM consolidation prompt broken** — Returns nothing actionable; `action: unknown` on all 9 runs
-3. **Extraction prompt captures chronicles** — "Agent decided X" not "WHY X matters"
-4. **No significance gate** — LLM creates memories for everything, not what's worth remembering
-5. **Hermes core bug** — `on_pre_compress()` return value silently discarded (issue #7192, open)
-
-### What Works In Production
-
-| System | Approach | Why It Works |
-|--------|----------|--------------|
-| Claude Code | Plain .md + grep, 200-line cap | Zero friction, always relevant |
-| Karpathy LLM Wiki | Add fact + query | No consolidation, no complexity |
-| mem0 (53k⭐) | Simple embedding + retrieval | Infrastructure, not AI brain |
-| openclaw-auto-dream | 5 layers + health_score | Aggressive filtering at capture |
-| scallopbot (8⭐) | NREM+REM phases | Most sophisticated, academic only |
-
-**Key insight:** Every successful system uses simple append + retrieval. Dream's consolidation approach (wikilink graph + LLM merge) is architecturally unique — and that uniqueness is the problem.
-
-### Path Forward
-
-Two options:
-
-**Option A — Strip Dream to fundamentals:**
-1. Remove wikilinks entirely
-2. Remove consolidation (no LLM merge, no prune)
-3. Keep: extraction + simple manifest + grep recall
-4. Add: per-session memory cap (max 3 new memories per session)
-5. Result: append-only journal with frontmatter, no AI consolidation
-
-**Option B — Full rebuild with different architecture:**
-1. Keep: taxonomy (user/feedback/project/reference)
-2. Keep: Obsidian vault storage
-3. Kill: wikilinks, consolidation engine, Related sections
-4. New: significance gate ("would this change a future decision?")
-5. New: simple grep/BM25 recall, no wikilink graph
-6. New: per-session cap (3 max)
-
-### Reference
-
-Full 360 review: [garuda/research/DREAM-360-REVIEW.md](https://github.com/dimasyankauskas/dream-memory-plugin/blob/main/RESURRECTION-RESEARCH.md)
+Fallback: `regex` mode uses pattern matching instead of LLM. Lower quality, but zero API cost and zero latency. Enable with `extraction_mode: regex`.
 
 ---
 
-## 📚 Related: llm-wiki (Still Active)
+## Discord Behavior
 
-The **llm-wiki** system (Karpathy LLM Wiki pattern) is still running and useful for a different purpose: reading large documentation/articles and storing key information. This is **manual curation** — Kedar or Garuda reads a big doc, decides what's worth saving, writes it to the wiki.
+Dream captures the full Discord session context from `gateway_session_key` at initialization:
 
-This is different from Dream's automatic session extraction. llm-wiki = deliberate human/agent-authored knowledge capture. Dream was supposed to be automatic.
+| Session key | Memory source tag |
+|------------|-----------------|
+| `agent:main:discord:thread:parent:thread` | `discord:thread:parent:thread` |
+| `agent:main:discord:group:channel` | `discord:group:channel` |
+| `agent:main:discord:dm:user` | `discord:dm:user` |
+| `agent:main:cli:default` | `cli:default` |
 
-The wiki is NOT being replaced. It continues normally.
+This means memories from different Discord channels and threads are traceable back to their exact source. Memories from CLI sessions are tagged `cli:default` or the appropriate platform identifier.
+
+---
+
+## Test Suite
+
+```bash
+cd dream-memory-plugin
+python3 -m pytest source/tests/ -v
+```
+
+563 tests. Core modules covered: store, taxonomy, recall, consolidation, extraction, provider interface.
+
+---
+
+## Migration from v1
+
+```bash
+python3 migrate.py --source /path/to/v1-vault --target /path/to/v2-vault
+```
+
+The migration script reads the v1 manifest, converts memory types to the v2 taxonomy (user → consciousness/relationship, project → consciousness/work, feedback stays feedback, reference stays reference), rewrites frontmatter, and produces a new manifest. Run it once. The v1 vault is not modified.
+
+---
+
+## Design Decisions
+
+**Why markdown files?** Transparency. No lock-in. You can read what the agent remembers without a tool. Edit it without an API. Share the vault as a plain Obsidian vault.
+
+**Why no vector search?** Startup latency. Dependencies. Index maintenance. For a memory system that caps at 3 new entries per session, manifest scanning is fast enough.
+
+**Why deterministic consolidation?** LLM consolidation failed 9 straight times in v1 production. Empty responses, action: unknown on every call. The deterministic pipeline dedups by content similarity, merges by slug collision, and enforces the line cap. No LLM required.
+
+**Why the staging workaround?** Hermes upstream silently discards `on_pre_compress()` return values (bug #7192, open). Dream writes candidates to `staging/*.jsonl` before compression. On the next session, `initialize()` merges them. The vault doesn't lose memories to context eviction.
+
+---
+
+## Comparisons
+
+| | Dream v2 | Vector DB (Pinecone, Weaviate) | Session Chronicle (Honcho) |
+|--|---------|--------------------------------|---------------------------|
+| **Format** | Plain .md + JSON manifest | Embeddings only | JSON transcript |
+| **Human-readable** | Yes | No | Partially |
+| **Human-editable** | Yes | No | No |
+| **No external deps** | Yes | No | Yes |
+| **Per-session cap** | Yes (max 3) | No | No |
+| **Discord-aware** | Yes | No | No |
+| **Wikilinks** | No | No | No |
+| **Consolidation** | Deterministic | None | None |
+| **Startup latency** | Near-zero | Depends on index size | Near-zero |
+
+---
+
+## Status
+
+v2 is running as the active memory provider for Hermes Agent. Vault at `~/apps/Garuda_hermes/dream` has 13 migrated memories from v1. New memories are tagged with Discord context.
+
+The Resurrection Research document that drove the v2 rewrite is in `RESURRECTION-RESEARCH.md`.
 
 ---
 
 ## License
 
-MIT License — see [LICENSE](./LICENSE) for details.
-
----
-
-## Acknowledgments
-
-Inspired by the **AutoDream** community and the insight that AI memory consolidation mirrors human sleep cycles. Special thanks to the Claude Code and OpenClaw developers who proved that a local folder of markdown notes + a scheduled dreaming routine is enough to create a digital brain that compounds in intelligence over time.
-
----
-
-<p align="center">
-  <strong>Stop forgetting. Start dreaming.</strong>
-</p>
+MIT. See `LICENSE`.
