@@ -1166,63 +1166,69 @@ def _build_llm_prompt(entries: List[MemoryEntry]) -> str:
     """
     memories_text = _format_memories_for_llm(entries)
 
-    system_prompt = """You are a memory consolidation engine. Your job is to analyse a set of
-memory entries and decide which ones should be merged, which are duplicates,
-which contradict each other, and which should have their relevance adjusted.
+    system_prompt = """You are a memory consolidation engine for a CLI AI assistant. Your job is to distill noise into signal.
 
-You MUST respond with a JSON object (no markdown fences, just raw JSON) with
-this exact schema:
+    The raw input includes ALL memories ever written — most are noise. A good consolidation REDUCES count significantly. 50 memories that compress to 5 is success. 50 memories that stay 50 is failure.
 
-{
-  "actions": [
+    You MUST respond with a JSON object (no markdown fences, just raw JSON) with
+    this exact schema:
+
     {
-      "action": "merge",
-      "source_indices": [0, 2],
-      "result_index": 0,
-      "merged_content": "Consolidated content combining both memories...",
-      "merged_tags": ["tag1", "tag2"],
-      "relevance": 0.8,
-      "details": "Merged two memories about user editor preferences"
-    },
-    {
-      "action": "deduplicate",
-      "keep_index": 1,
-      "remove_indices": [3],
-      "details": "Memory 3 is a near-duplicate of memory 1"
-    },
-    {
-      "action": "contradict",
-      "newer_index": 5,
-      "older_indices": [4],
-      "details": "Memory 5 contradicts memory 4; newer version supersedes"
-    },
-    {
-      "action": "compress",
-      "target_index": 6,
-      "compressed_content": "Shorter version of the content...",
-      "details": "Compressed verbose reference from 150 lines to 30"
-    },
-    {
-      "action": "boost_relevance",
-      "target_indices": [0],
-      "new_relevance": 0.85,
-      "details": "Frequently accessed memory deserves higher relevance"
+      "actions": [
+        {
+          "action": "merge",
+          "source_indices": [0, 2],
+          "result_index": 0,
+          "merged_content": "Consolidated content...",
+          "merged_tags": ["tag1", "tag2"],
+          "relevance": 0.8,
+          "details": "..."
+        },
+        {
+          "action": "deduplicate",
+          "keep_index": 1,
+          "remove_indices": [3],
+          "details": "..."
+        },
+        {
+          "action": "contradict",
+          "newer_index": 5,
+          "older_indices": [4],
+          "details": "Memory 5 contradicts memory 4; newer version supersedes"
+        },
+        {
+          "action": "compress",
+          "target_index": 6,
+          "compressed_content": "Shorter version...",
+          "details": "Compressed verbose reference from 150 lines to 30"
+        },
+        {
+          "action": "boost_relevance",
+          "target_indices": [0],
+          "new_relevance": 0.85,
+          "details": "..."
+        },
+        {
+          "action": "delete",
+          "target_indices": [7, 8, 9],
+          "details": "Session chronicles — no durable insight. 'worked on X' is not a memory."
+        }
+      ]
     }
-  ]
-}
 
-Rules:
-- When merging, combine all content intelligently. Preserve all unique facts.
-- When resolving contradictions, always keep the NEWER memory (higher created timestamp).
-- When deduplicating, keep the newer or more detailed version.
-- For compress, produce a concise but complete summary — do NOT lose key information.
-- For boost_relevance, increase relevance for memories that appear across multiple topics.
-- Only produce actions that add value. If memories are fine as-is, return an empty actions list.
-- source_indices, keep_index, newer_index, target_indices, remove_indices, older_indices
-  refer to 0-based indices in the input memory list.
-- result_index is the 0-based index of the memory to keep as the merge target.
-- merged_content or compressed_content must preserve ALL important information.
-- merged_tags should be the union of tags from all source memories."""
+    Rules:
+    - Be AGGRESSIVE with deletion. If a memory is a session chronicle (worked on X, ran Y, created Z) with no decision or insight — DELETE it.
+    - When merging, combine all unique facts. Include WHY decisions were made (decided_by relationships).
+    - When resolving contradictions, keep the NEWER memory.
+    - When deduplicating, keep the more detailed or recently updated version.
+    - For compress, preserve key facts AND rationale. Compress the verbose, keep the signal.
+    - boost_relevance only for memories that appear cross-session.
+    - ONLY produce actions that add value. Empty actions array = memories were already good.
+    - source_indices, keep_index, newer_index, target_indices, remove_indices, older_indices
+      refer to 0-based indices in the input memory list.
+    - merged_content or compressed_content must preserve ALL important information.
+    - merged_tags should be the union of tags from all source memories.
+    - If deleting more than half the memories, that's fine — that's the point."""
 
     user_prompt = f"Analyse these {len(entries)} memories and produce consolidation actions:\n\n{memories_text}"
 
@@ -1373,6 +1379,19 @@ def _parse_llm_response(
                             target_files=[f"{target.memory_type}:{target.filename}"],
                             result_file=f"{target.memory_type}:{target.filename}",
                             details=details or f"Boost relevance to {new_relevance:.2f}",
+                        ))
+
+            elif action_type == "delete":
+                target_indices = raw.get("target_indices", [])
+                for idx in target_indices:
+                    if idx < len(entries):
+                        target = entries[idx]
+                        actions.append(ConsolidationAction(
+                            action="delete",
+                            target_type=target.memory_type,
+                            target_files=[f"{target.memory_type}:{target.filename}"],
+                            result_file="",
+                            details=details or f"Delete: no durable insight in {target.filename}",
                         ))
 
         except (IndexError, ValueError, TypeError) as exc:
@@ -1567,7 +1586,7 @@ def llm_consolidate(
     merges, superseded_from_merges = _extract_llm_merges(llm_actions, memories, raw_response)
     result.merges = merges
 
-    # Build superseded list from dedup, contradict, and merge actions
+    # Build superseded list from dedup, contradict, delete, and merge actions
     superseded: List[str] = list(superseded_from_merges)
     for action in llm_actions:
         if action.action == "deduplicate":
@@ -1582,6 +1601,11 @@ def llm_consolidate(
                 older_key = action.target_files[1]
                 if older_key not in superseded:
                     superseded.append(older_key)
+        elif action.action == "delete":
+            # All files in a delete action are removed
+            for target_key in action.target_files:
+                if target_key not in superseded:
+                    superseded.append(target_key)
     result.superseded = superseded
 
     # Build capped list from compress actions
@@ -1603,6 +1627,7 @@ def llm_consolidate(
         "merged_count": result.merged_count,
         "deduped_count": result.deduped_count,
         "contradictions_resolved": result.pruned_count,
+        "deleted_count": sum(1 for a in llm_actions if a.action == "delete"),
         "compressions_queued": len(capped),
         "mode": "llm",
     }
@@ -1652,6 +1677,11 @@ def prune(
         try:
             mem_type = merge_info["memory_type"]
             filename = merge_info["filename"]
+            # Guard: file may have been deleted as superseded since consolidate ran
+            filepath = store.get_memory_path(mem_type, filename)
+            if not filepath.exists():
+                logger.debug("Prune: skip merge %s/%s — file already deleted (likely superseded)", mem_type, filename)
+                continue
             store.update_memory(
                 mem_type,
                 filename,
@@ -1677,6 +1707,9 @@ def prune(
                 truncated = "\n".join(lines[:file_max_lines])
                 store.update_memory(mem_type, filename, content=truncated)
                 result.capped_files.append(f"capped {mem_type}/{filename}")
+        except FileNotFoundError:
+            # File was deleted as superseded since consolidate built the plan
+            logger.debug("Prune: skip cap %s/%s — file already deleted", mem_type, filename)
         except Exception as exc:
             logger.warning("Prune: failed to cap %s/%s: %s", mem_type, filename, exc)
 

@@ -80,7 +80,7 @@ def _load_full_vault_memories(store: DreamStore) -> List[Dict[str, Any]]:
     memories = []
 
     for entry in manifest:
-        mem_type = entry.get("memory_type", "")
+        mem_type = entry.get("memory_type") or entry.get("type", "")
         # Skip proposals — they're the output, not input
         if mem_type == _PROPOSAL_KIND or mem_type not in MEMORY_TYPES:
             continue

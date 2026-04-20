@@ -201,8 +201,9 @@ class TestBuildPrompt:
         assert "(no existing memories)" in prompt
 
     def test_system_prompt_contains_rules(self):
-        assert "INSIGHT" in _SYSTEM_PROMPT
-        assert "NOT" in _SYSTEM_PROMPT
+        assert "insight" in _SYSTEM_PROMPT.lower()
+        assert "session chronicle" in _SYSTEM_PROMPT.lower()
+        assert "empty" in _SYSTEM_PROMPT.lower() or "[]" in _SYSTEM_PROMPT
 
     def test_system_prompt_contains_taxonomy(self):
         """Verify the system prompt defines all 4 memory types."""

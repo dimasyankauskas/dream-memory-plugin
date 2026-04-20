@@ -223,10 +223,6 @@ class DreamStore:
             type_dir = self._dream_root / type_name
             type_dir.mkdir(exist_ok=True)
 
-        # proposals/ lives alongside the four type directories
-        proposals_dir = self._dream_root / "proposals"
-        proposals_dir.mkdir(exist_ok=True)
-
         # Init manifest if absent
         manifest_path = self._dream_root / _MANIFEST_FILE
         if not manifest_path.exists():
@@ -316,89 +312,16 @@ class DreamStore:
         )
 
         logger.debug("Dream: created %s", filepath)
+
+        # ── LLM Wiki cross-reference hook ──────────────────────────
+        # DISABLED: wiki cross-reference creates stub pollution in the vault.
+        # Dream memories should stay in dream/ and be ingested into wiki
+        # explicitly via the /wiki add flow, not automatically.
+        # To re-enable, set plugins.dream.wiki_crossref: true in config.yaml
+        if self._config.get("wiki_crossref", False):
+            self._wiki_cross_reference(memory_type, content, tags or [], filepath)
+
         return filepath
-
-    # -- Proposals -----------------------------------------------------------
-
-    def get_proposal_path(self, filename: str) -> Path:
-        """Resolve the full path for a proposal file in the proposals/ directory."""
-        if not filename.endswith(".md"):
-            filename += ".md"
-        return self._dream_root / "proposals" / filename
-
-    def add_proposal(
-        self,
-        title: str,
-        body: str,
-        confidence: float,
-        tags: Optional[List[str]] = None,
-        related_memory_refs: Optional[List[str]] = None,
-        source: str = "",
-        importance: float = 0.5,
-        relevance: float = 0.5,
-        forgetting_factor: Optional[float] = None,
-    ) -> Path:
-        """Add a proposal memory to the vault.
-
-        Proposals are written to ``proposals/`` (not a type subdirectory) and
-        tracked in the manifest with ``memory_type: proposal``. The body should
-        include the full proposal content structured as:
-        ``## What I noticed\\n...\\n## Evidence\\n...\\n## Recommendation\\n...``
-
-        Returns the Path to the created file.
-        """
-        effective_forgetting = forgetting_factor if forgetting_factor is not None else 0.01
-        slug = slugify(title, max_words=4)
-        ts = _timestamp_str()
-        suffix = "".join(random.choices(_string_module.ascii_lowercase + _string_module.digits, k=4))
-        filename = f"{slug}-{ts}-{suffix}.md"
-
-        # Build content with header for context
-        content = f"## {title}\n\n{body}"
-
-        doc = make_memory_document(
-            content=content,
-            memory_type="proposal",
-            tags=tags or [],
-            source=source,
-            relevance=relevance,
-            importance=importance,
-            forgetting_factor=effective_forgetting,
-        )
-
-        # Extra frontmatter fields for proposals (stored in frontmatter dict, not render args)
-        meta = parse_frontmatter(doc)
-        meta["confidence"] = confidence
-        if related_memory_refs:
-            meta["related_memories"] = related_memory_refs
-
-        filepath = self.get_proposal_path(filename)
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        filepath.write_text(doc, encoding="utf-8")
-
-        # Update manifest
-        self._add_manifest_entry(
-            "proposal", filename, content, tags or [], source,
-            relevance, importance, effective_forgetting,
-        )
-
-        logger.debug("Dream: created proposal %s", filepath)
-        return filepath
-
-    def read_proposal(self, filename: str) -> Dict[str, Any]:
-        """Read and parse a proposal file.
-
-        Returns a dict with ``meta`` (frontmatter dict), ``body`` (content
-        below the frontmatter), and ``path`` (string path).
-        """
-        filepath = self.get_proposal_path(filename)
-        if not filepath.exists():
-            raise FileNotFoundError(f"Proposal not found: {filepath}")
-
-        text = filepath.read_text(encoding="utf-8")
-        meta = parse_frontmatter(text)
-        body = self._extract_body(text)
-        return {"meta": meta, "body": body, "path": str(filepath)}
 
     # -- Read ---------------------------------------------------------------
 
@@ -728,3 +651,93 @@ class DreamStore:
         """Reset session counter to 0 (called after successful consolidation)."""
         counter_path = self._dream_root / ".session_counter.json"
         counter_path.write_text(json.dumps({"count": 0, "last_increment": datetime.now(timezone.utc).isoformat()}))
+
+    # -- LLM Wiki cross-reference ─────────────────────────────────────────
+
+    def _wiki_cross_reference(
+        self,
+        memory_type: str,
+        content: str,
+        tags: List[str],
+        dream_filepath: Path,
+    ) -> None:
+        """After storing a dream memory, create or update a stub wiki page.
+
+        This keeps the ObsidianVault wiki graph connected to dream memories.
+        For each dream memory with tags, we check if a wiki page exists for
+        that topic. If not, we create a minimal stub page linking to the dream.
+        """
+        import os as _os
+        vault_path = _os.environ.get(
+            "OBSIDIAN_VAULT_PATH",
+            str(Path.home() / "apps/Garuda_hermes/ObsidianVault"),
+        )
+        vault = Path(vault_path)
+        if not vault.exists():
+            return  # No vault, skip cross-ref
+
+        index_path = vault / "index.md"
+        log_path = vault / "log.md"
+
+        # Only cross-ref project and feedback types (most wiki-relevant)
+        if memory_type not in ("project", "feedback", "user"):
+            return
+
+        # Build a page name from the first tag or content slug
+        page_name = None
+        folder = "research"
+        if tags:
+            primary_tag = tags[0]
+            page_name = primary_tag.replace("_", "-").replace(" ", "-")
+        if not page_name:
+            slug = slugify(content)
+            page_name = slug[:40] if len(slug) > 40 else slug
+
+        # Determine appropriate folder
+        if memory_type == "project":
+            folder = "projects"
+        elif memory_type == "feedback":
+            folder = "research"
+
+        wiki_page = vault / folder / f"{page_name}.md"
+
+        if wiki_page.exists():
+            # Append a "Related Dream Memory" section if not already there
+            existing = wiki_page.read_text(encoding="utf-8", errors="replace")
+            dream_link = f"dream/{dream_filepath.name}"
+            if dream_link not in existing:
+                section = f"\n## Related Dream Memories\n- [[{dream_link}]]\n"
+                wiki_page.write_text(existing + section, encoding="utf-8")
+                logger.debug("Dream wiki cross-ref: appended to %s", wiki_page)
+        else:
+            # Create stub page
+            now = _timestamp_str()[:10]
+            dream_link = f"dream/{dream_filepath.name}"
+            stub = (
+                f"---\ntitle: {page_name}\ncreated: {now}\nupdated: {now}\n"
+                f"type: concept\ntags: [{', '.join(tags)}]\nsources: [dream]\n---\n\n"
+                f"# {page_name}\n\n> Stub page — created from Dream memory cross-reference.\n"
+                f"> Ingest a source about this topic to flesh it out.\n\n"
+                f"## Related Dream Memories\n- [[{dream_link}]]\n"
+            )
+            wiki_page.parent.mkdir(parents=True, exist_ok=True)
+            wiki_page.write_text(stub, encoding="utf-8")
+            logger.debug("Dream wiki cross-ref: created stub %s", wiki_page)
+
+            # Add to index.md
+            if index_path.exists():
+                idx = index_path.read_text(encoding="utf-8", errors="replace")
+                link_line = f"- [[{page_name}]] — Dream cross-reference stub\n"
+                if link_line not in idx:
+                    # Insert before the Dream Memories section
+                    marker = "## Dream Memories"
+                    if marker in idx:
+                        idx = idx.replace(marker, link_line + marker)
+                        index_path.write_text(idx, encoding="utf-8")
+
+        # Append to wiki log
+        if log_path.exists():
+            now = _timestamp_str()[:10]
+            entry = f"\n## [{now}] crossref | Dream → Wiki: {page_name} ({memory_type})\n"
+            log_content = log_path.read_text(encoding="utf-8", errors="replace")
+            log_path.write_text(log_content + entry, encoding="utf-8")
