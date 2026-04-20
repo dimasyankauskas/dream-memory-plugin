@@ -12,19 +12,11 @@ Dream v2 extracts what **matters** at session end. Stores it in plain markdown. 
 
 ---
 
-## Why not vector memory?
+## Features
 
-Vector databases are built for retrieval at scale. Pinecone, Weaviate, Qdrant — they assume you have thousands of documents and need semantic search across all of them. That's not the scenario here.
+**Plain-text vault.** Every memory is a `.md` file with YAML frontmatter. Open it in any editor. Edit it without an API call. No proprietary format, no database to query.
 
-In Hermes, the memory provider sees every session. At session end, it extracts a maximum of 3 memories. The vault grows slowly — maybe 10–20 new entries per week. At that volume, manifest scanning is faster than vector search startup latency. No embedding model. No index to maintain. No external service to pay for or self-host.
-
-If you're running 50 concurrent agents with a 100K-entry memory store, you want vector search. If you want one agent that remembers what it learned across Discord sessions — Dream is the right tool for that job.
-
----
-
-## What it is
-
-A flat-file consciousness layer. Markdown memories, a JSON manifest, a recall scorer with Ebbinghaus forgetting curves, and a consolidation pipeline that runs without an LLM call.
+**Five memory types, structured.**
 
 ```
 vault/
@@ -40,13 +32,7 @@ vault/
 └── MEMORY.md              ← lightweight index for system prompt injection
 ```
 
-Every memory is a `.md` file with YAML frontmatter. Open it in any editor. Edit it without an API.
-
----
-
-## Discord is a first-class signal
-
-Dream captures the full session context from Hermes's `gateway_session_key` at startup:
+**Discord-aware tagging.** Dream captures the full session context from Hermes's `gateway_session_key` at startup. Memories carry their source traceable back to the exact Discord thread or channel — no guessing which thread a preference came from.
 
 | Session key pattern | Memory source tag |
 |--------------------|-------------------|
@@ -55,39 +41,77 @@ Dream captures the full session context from Hermes's `gateway_session_key` at s
 | `agent:main:discord:dm:user` | `discord:dm:user` |
 | `agent:main:cli:default` | `cli:default` |
 
-Memories from different Discord threads and channels are traceable back to their exact source. No guessing which thread a preference came from.
+**Per-session cap with significance gate.** Maximum 3 memories per session. The LLM extraction model scores significance — only entries above 0.7 threshold survive. The vault grows slowly. Searching it stays fast.
+
+**Deterministic consolidation.** The dedup/merge/size-cap pipeline runs without an LLM call. No empty responses, no API cost. It actually does something on every run.
+
+**Pre-compress rescue.** Hermes has an open bug (`#7192`) where `on_pre_compress()` return values are silently discarded. When context compression fires mid-session, any memories the provider tried to extract get lost — unless Dream v2 catches them first. Candidates write to `staging/*.jsonl` before compression. On the next session, `initialize()` merges them into the vault. No memory lost to context eviction.
+
+**Ebbinghaus recall scoring.** `dream_recall` ranks memories by tag overlap, importance, recency, and access count. The scoring follows forgetting-curve intuition — older, less-accessed memories drift down unless reinforced.
+
+**Three tools out of the box.**
+
+| Tool | What it does |
+|------|-------------|
+| `dream_status` | Vault stats — count per type, total memories, extraction count for this session |
+| `dream_recall` | Query the manifest. Returns scored memories with content snippets, ranked by tag overlap, importance, recency, and access count |
+| `dream_consolidate` | Run the deterministic pipeline: audit → dedup → merge → size-cap → rebuild MEMORY.md index |
 
 ---
 
-## Pre-compress rescue — the workaround that matters
+## Use cases
 
-Hermes has an open bug (`#7192`) where `on_pre_compress()` return values are silently discarded. When context compression fires mid-session, any memories the provider tried to extract get lost.
+**Long-running agent context.** When the agent works across dozens of Discord sessions on the same project, Dream prevents re-explaining the same context every time. Corrections stick. Preferences accumulate.
 
-Dream v2 works around this. Before compression, candidates write to `staging/*.jsonl`. On the next session, `initialize()` merges them into the vault. No memory lost to context eviction.
+**Human-in-the-loop workflows.** When the agent receives corrections mid-session — "always use snake_case, not camelCase" — Dream captures that feedback and surfaces it when relevant, not just in the session where it was received.
 
----
+**Tactical decision memory.** When you and the agent agree on an approach — "we'll use接过 for auth, not the笨笨笨 pattern" — that lives in `decisions/` and gets retrieved with the right query.
 
-## What v1 broke — and why v2 is different
-
-v1 shipped. It ran for 5 days. 171 memories. 9 consolidation attempts. Here's what happened:
-
-**Chronicle trap.** The LLM extracted session logs — "what happened" — not insights. Largest file in the vault: 459 lines of transcript.
-
-**Wikilink explosion.** Consolidation tried to cross-link every memory by shared tags. Some files had 80+ wikilinks. The graph was untraversable.
-
-**No significance gate.** ~240 memories per week. Target was 15–20. The vault grew until it was faster to forget than to search.
-
-**LLM consolidation never fired.** 9 straight runs, all returned `merged=0 pruned=0`. Empty responses. `action: unknown`. The consolidation pipeline was dead on arrival.
-
-v2 fixed all four. Stripped wikilinks. Removed LLM consolidation entirely. Added a per-session cap of 3 memories with a significance threshold of 0.7. Built a deterministic dedup/merge/size-cap pipeline. Now consolidation actually does something — and it runs without an API call.
+**Operational reference.** When an API has a known quirk — "the `/projects/:id/export` endpoint requires `content-type: application/json` header or it 500s" — that lives in `reference/` and survives session resets.
 
 ---
 
-## What it does NOT do
+## When to use Dream v2
 
-No wikilinks. No LLM consolidation. No auto-recall by default. No per-turn extraction.
+Dream is the right tool when:
 
-If you want cross-references, use `dream_recall` and read the manifest. If you want the agent to surface memories proactively on every turn, set `auto_recall: true` — but the default is off, which is the right call for most setups.
+- You run one agent across many Discord sessions and want it to accumulate context
+- You want a vault you can open in Obsidian and read like notes
+- You'd rather not manage a vector database for a slowly-growing personal memory store
+- You want to edit memories directly without an API call
+
+Use a vector database instead when:
+
+- You're running dozens of concurrent agents with thousands of memories
+- You need semantic search across all memories at query time
+- You can absorb the startup latency and infrastructure overhead
+
+For a single agent with a few sessions per week, vector search is overkill. Dream starts in near-zero time, costs nothing in regex mode, and the vault stays readable.
+
+---
+
+## Why not vector memory?
+
+Vector databases are built for retrieval at scale. Pinecone, Weaviate, Qdrant — they assume you have thousands of documents and need semantic search across all of them. That's a different problem.
+
+At Dream's scale — max 3 memories per session, vault growth of 10–20 entries per week — manifest scanning is faster than vector search startup latency. No embedding model. No index to maintain. No external service to pay for or self-host.
+
+---
+
+## How it compares
+
+| | Dream v2 | Vector DB (Pinecone, Weaviate) | Built-in memory |
+|----|---------|-------------------------------|-----------------|
+| **Format** | Plain .md + JSON manifest | Embeddings only | Plain text |
+| **Human-readable** | Yes | No | Partially |
+| **Human-editable** | Yes | No | No |
+| **Discord-aware** | Yes | No | No |
+| **No external service** | Yes | No | Yes |
+| **Per-session cap** | Yes (max 3) | No | No |
+| **Wikilinks** | No | No | No |
+| **Consolidation** | Deterministic | None | None |
+| **Works without API key** | Yes (regex mode) | No | Yes |
+| **Startup latency** | Near-zero | Depends on index size | Near-zero |
 
 ---
 
@@ -126,16 +150,6 @@ hermes memory status
 
 ---
 
-## Tools
-
-| Tool | What it does |
-|------|-------------|
-| `dream_status` | Vault stats — count per type, total memories, extraction count for this session |
-| `dream_recall` | Query the manifest. Returns scored memories with content snippets, ranked by tag overlap, importance, recency, and access count |
-| `dream_consolidate` | Run the deterministic pipeline: audit → dedup → merge → size-cap → rebuild MEMORY.md index |
-
----
-
 ## Extraction model
 
 Default: `glm-5.1:agentic` via Ollama (local). Any OpenAI-compatible endpoint works — set `extraction_base_url` and `api_key`.
@@ -144,32 +158,9 @@ Fallback: `regex` mode. Pattern matching instead of LLM. Lower quality, but zero
 
 ---
 
-## How it compares
-
-| | Dream v2 | Vector DB (Pinecone, Weaviate) | Built-in memory |
-|----|---------|--------------------------------|-----------------|
-| **Format** | Plain .md + JSON manifest | Embeddings only | Plain text |
-| **Human-readable** | Yes | No | Partially |
-| **Human-editable** | Yes | No | No |
-| **Discord-aware** | Yes | No | No |
-| **No external service** | Yes | No | Yes |
-| **Per-session cap** | Yes (max 3) | No | No |
-| **Wikilinks** | No | No | No |
-| **Consolidation** | Deterministic | None | None |
-| **Works without API key** | Yes (regex mode) | No | Yes |
-| **Startup latency** | Near-zero | Depends on index size | Near-zero |
-
-Use Dream v2 when: you want one agent that accumulates context across Discord sessions, you want a vault you can open in Obsidian, and you'd rather not manage a vector database.
-
-Use a vector DB when: you're running dozens of agents with thousands of memories and you need semantic search across all of them at query time.
-
----
-
 ## Status
 
 v2 is running as the active memory provider for Hermes Agent. The vault at [~/dream](https://github.com/dimasyankauskas/dream-memory-plugin) has 13 migrated memories from v1. New memories carry their Discord context.
-
-The document that drove the v2 rewrite — root-cause analysis of the 5-day production failure — is in `RESURRECTION-RESEARCH.md`.
 
 ---
 
