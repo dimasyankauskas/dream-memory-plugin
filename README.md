@@ -1,6 +1,6 @@
 # 🧠 Dream Memory Plugin for Hermes
 
-> **⚠️ STATUS: PAUSED** — This plugin is not actively running. See [Resurrection Research](#-resurrection-research) for the path forward.
+> **⚠️ STATUS: ACTIVE** — Dream v2 is running as the primary memory provider for Hermes Agent.
 
 Dream Memory is an **Obsidian-backed session memory consolidation** system for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It extracts structured memories from conversations, organizes them by taxonomy, and periodically consolidates them to prevent vault bloat.
 
@@ -413,16 +413,14 @@ pytest source/tests/ --cov=dream --cov-report=html
 - [x] **LLM-powered extraction** — Anthropic AutoDream-style forked LLM agent for session-end memory extraction
 - [x] **Cron integration** — Automatic nightly consolidation via Hermes scheduler (3am daily)
 - [x] **Obsidian integration** — vault_path + vault_subdir for Obsidian-native vault
-- [x] **Wikilink knowledge graph** — [[cross-references]] between memories by shared tags
 - [x] **Forgetting curves** — Ebbinghaus retention scoring with access-based decay
 - [x] **Consolidation lock** — PID-based prevents concurrent consolidation runs
 - [x] **Session count gate** — Dual-gate: 24h AND ≥5 sessions before consolidation
-
-### Blocked — Need Resolution (see Resurrection Research)
-- [ ] **Consolidation fires but produces nothing** — LLM returns empty/nothing actionable (9 runs, 0 merges, 0 prunes)
-- [ ] **Wikilink explosion** — 80 wikilinks per file makes consolidation graph untraversable
-- [ ] **Chronicle trap** — Session-end extraction captures "what happened" not "why it matters"
-- [ ] **26x too many memories** — Target 15-20/week, actual ~240/week
+- [x] **Wikilinks removed** — v2 intentionally has no wikilinks; consolidation is deterministic markdown processing
+- [x] **Deterministic consolidation** — Consolidation pipeline rewritten; no LLM merge step, no wikilink generation
+- [x] **Per-session memory cap (max 3)** — Significance gate + cap prevents vault bloat
+- [x] **Pre-compress staging rescue** — JSONL staging via `staging.py` works around Hermes upstream bug #7192
+- [x] **Discord context tracking** — Memories tagged with `discord:thread:parent:thread`, `discord:group:channel`, or `discord:dm:user`
 
 ### Future
 - [ ] **NREM/REM two-phase** — Deep consolidation (NREM) + creative association (REM)

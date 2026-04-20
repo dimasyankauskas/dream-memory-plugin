@@ -36,8 +36,8 @@ class TestValidateMemoryType:
 # ---------------------------------------------------------------------------
 
 class TestMemoryTypes:
-    def test_all_four_types_present(self):
-        expected = {"user", "feedback", "project", "reference"}
+    def test_all_five_types_present(self):
+        expected = {"user", "feedback", "project", "reference", "proposal"}
         assert set(MEMORY_TYPES.keys()) == expected
 
     def test_each_spec_has_required_fields(self):

@@ -1,20 +1,12 @@
-"""Dream Memory LLM-based Extraction — high-quality memory extraction via LLM.
+"""Dream v2 LLM Extraction — Distillation prompt for significant memories.
 
-Uses an OpenAI-compatible API to extract structured memories from conversation
-transcripts.  This is the QUALITY path (vs. the regex-based fast path in
-extract.py) and is called at session end.
+This is the core fix from v1: instead of "what happened" (chronicles),
+this asks "what matters" (distilled insights).
 
-Architecture:
-  - extract.py (regex): per-turn, fast, zero-cost → catches obvious patterns
-  - extract_llm.py (LLM): session-end, slower, higher quality → extracts insights
-
-Config keys (reused from consolidation, with optional overrides):
-  - extraction_mode: 'regex' | 'llm' | 'both' (default: 'llm')
-  - extraction_model: model identifier (default: consolidate_model)
-  - extraction_api_key: API key (default: consolidate_api_key → env vars)
-  - extraction_base_url: base URL (default: consolidate_base_url → env vars)
-  - extraction_timeout: seconds to wait for LLM response (default: 30)
-  - consolidate_model, consolidate_api_key, consolidate_base_url: fallbacks
+Model selection: glm-5.1:agentic
+- Long-horizon optimization (sustains hundreds of rounds)
+- Best SWE-Pro (58.4%) — good for analytical distillation
+- From MODEL_PORTFOLIO_INDEX.md
 """
 
 from __future__ import annotations
@@ -22,458 +14,236 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
-import urllib.request
-import urllib.error
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-
-from .extract import CandidateMemory
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Defaults
-# ---------------------------------------------------------------------------
+# Default Ollama endpoint
+DEFAULT_BASE_URL = "http://localhost:11434/v1"
 
-DEFAULT_EXTRACTION_MODEL: str = "glm-5.1:cloud"
-DEFAULT_EXTRACTION_TIMEOUT: int = 60  # seconds (Ollama/cloud models need more time)
-DEFAULT_BASE_URL: str = "https://openrouter.ai/api/v1"
 
-# Valid extraction modes
-_VALID_MODES = {"regex", "llm", "both"}
-
-# Valid memory types (must match taxonomy)
-VALID_MEMORY_TYPES = {"user", "feedback", "project", "reference"}
-
-# ---------------------------------------------------------------------------
-# Extraction prompt template
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT = """You are a memory extraction agent for a CLI AI assistant. Your job is NOT to write a session chronicle. Your job is to extract durable insights that will make the assistant smarter in FUTURE sessions.
-
-## The Core Rule
-If nothing significant happened — return an EMPTY memories array. It is ALWAYS better to save nothing than to save noise. 50 sessions of noise do not become signal through consolidation.
-
-## What is NOT an Insight (Never Save These)
-
-- "Worked on X", "ran Y command", "created Z file" — these are session chronicles, not memories
-- Task status updates, current progress, what's in-flight
-- Greetings, acknowledgments, "thanks", "sounds good"
-- Session metadata (session IDs, timestamps, platform names)
-- Information already in existing memories (check the list below)
-- Preferences the user already stated multiple times (deduplicate)
-- Raw conversation dumps or verbose exchanges
-- Opinions not expressed as actionable preferences
-
-## What IS an Insight
-
-1. **Corrections**: "don't do X", "stop saving Y", explicit pushback
-2. **Validated Decisions**: user confirmed an approach worked, especially non-obvious ones — include the WHY
-3. **New Preferences**: a preference stated for the first time
-4. **Rationale**: why something was decided (decided_by relationships — most valuable)
-5. **Non-obvious Facts**: stable facts not derivable from code or documentation
-6. **Cross-session Patterns**: something true across multiple sessions
-
-## Memory Types
-
-Pick the most appropriate type:
-- **user**: Who the user is, their role, communication style, goals. Example: "User runs a solo AI agent operation — prefers terse outputs, zero fluff"
-- **feedback**: Corrections, directives, confirmed approaches. Example: "User wants short confirmations only — 'Updated. Got it.' style, no long explanations"
-- **project**: Technical decisions, architecture choices, project state. Example: "Dream plugin uses Obsidian vault at ~/apps/Garuda_hermes/ObsidianVault/"
-- **reference**: Stable paths, URLs, API quirks, tool behaviors. Example: "NotebookLM MCP source_add takes urls=[url] not url=url"
-
-## Significance Threshold
-
-Only save if:
-- Would the assistant make a different decision in a future session because of this?
-- Does this capture WHY, not just WHAT?
-- Is this non-obvious or surprising?
-
-If "just interesting" or "might be useful someday" — don't save. Memories are expensive.
-
-## Output Format
-
-Return a JSON object with a single "memories" array. Each entry:
-- type: "user" | "feedback" | "project" | "reference"
-- content: self-contained fact with WHY where applicable. No "the user said...", just the insight
-- tags: 1-3 lowercase tags
-- relevance: 0.7-0.9 for preferences/corrections, 0.5-0.7 for decisions, 0.3-0.5 for references
-
-If no significant memories found:
-```json
-{"memories": []}
-```
-
-Return JSON only — no markdown fences, no commentary.
-"""
-
-_USER_PROMPT_TEMPLATE = """## Existing Memories
-{manifest_summary}
-
-## Conversation
-{conversation}"""
-
-# ---------------------------------------------------------------------------
-# LLMExtractor
-# ---------------------------------------------------------------------------
+@dataclass
+class ExtractedMemory:
+    content: str
+    type: str
+    tags: List[str]
+    importance: float
+    slug: str
 
 
 class LLMExtractor:
-    """Extract candidate memories from conversations using an LLM call.
+    """Extract significant memories using LLM distillation."""
 
-    Uses an OpenAI-compatible API (via urllib, no external deps) to send
-    the conversation transcript to an LLM and parse the structured JSON
-    response into CandidateMemory objects.
-    """
-
-    def __init__(self, config: dict):
-        """Initialise the extractor from plugin config.
-
-        Resolution order for each setting:
-          extraction_X → consolidate_X → env var → default
-        """
-        self._config = config
-
-        # Resolve API key
-        self._api_key = (
-            config.get("extraction_api_key", "")
-            or config.get("consolidate_api_key", "")
-            or os.getenv("OPENROUTER_API_KEY", "")
-            or os.getenv("OPENAI_API_KEY", "")
-        )
-        # Treat placeholder values as absent
-        if self._api_key in ("", "***"):
-            self._api_key = ""
-
-        # Resolve base URL
-        self._base_url = (
-            config.get("extraction_base_url", "")
-            or config.get("consolidate_base_url", "")
-            or os.getenv("OPENAI_BASE_URL", "")
-            or DEFAULT_BASE_URL
-        ).rstrip("/")
-
-        # Resolve model
-        self._model = (
-            config.get("extraction_model", "")
-            or config.get("consolidate_model", "")
-            or DEFAULT_EXTRACTION_MODEL
-        )
-
-        # Timeout
-        self._timeout = int(config.get("extraction_timeout", DEFAULT_EXTRACTION_TIMEOUT))
-
-    # -- Public API ----------------------------------------------------------
-
-    def extract(
+    def __init__(
         self,
-        session_id: str,
-        messages: List[dict],
-        manifest_summary: str = "",
-    ) -> List[CandidateMemory]:
-        """Extract memories from conversation messages using LLM.
+        model: str = "glm-5.1:agentic",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        timeout: int = 120,
+    ):
+        self.model = model
+        self.base_url = base_url or DEFAULT_BASE_URL
+        self.timeout = timeout
+        self._client: Optional[Any] = None
 
-        Falls back gracefully: if the LLM call fails or times out,
-        returns an empty list (logs a warning).
-
-        Parameters
-        ----------
-        session_id:
-            Session identifier (used for logging).
-        messages:
-            List of message dicts, each with ``role`` and ``content``.
-        manifest_summary:
-            Summary of existing memories for dedup awareness (optional).
-
-        Returns
-        -------
-        List[CandidateMemory]
-            Extracted candidate memories. Empty on failure.
-        """
-        # Ollama / local servers don't need API keys — skip the check
-        # when the base URL points at localhost or a private network.
-        is_local = bool(
-            self._base_url
-            and (
-                "localhost" in self._base_url
-                or "127.0.0.1" in self._base_url
-                or "0.0.0.0" in self._base_url
-                or "::1" in self._base_url
-                or self._base_url.startswith("http://192.168")
-                or self._base_url.startswith("http://10.")
-                or self._base_url.startswith("http://172.")
-            )
-        )
-
-        if not self._api_key and not is_local:
-            logger.warning(
-                "LLM extraction skipped: no API key configured "
-                "(checked extraction_api_key, consolidate_api_key, "
-                "OPENROUTER_API_KEY, OPENAI_API_KEY)"
-            )
-            return []
-
-        if not messages:
-            return []
-
-        prompt = self._build_prompt(messages, manifest_summary)
-        try:
-            raw_response = self._call_llm(prompt)
-        except Exception as exc:
-            logger.warning("LLM extraction call failed for session %s: %s", session_id, exc)
-            return []
-
-        if not raw_response:
-            logger.warning("LLM extraction returned empty response for session %s", session_id)
-            return []
-
-        candidates = self._parse_response(raw_response)
-        logger.info(
-            "LLM extraction: session %s produced %d candidates",
-            session_id, len(candidates),
-        )
-        return candidates
-
-    # -- Prompt building -----------------------------------------------------
-
-    def _build_prompt(self, messages: List[dict], manifest_summary: str = "") -> str:
-        """Build the user-facing extraction prompt."""
-        conversation = self._format_messages(messages)
-        summary = manifest_summary.strip() if manifest_summary else "(no existing memories)"
-        return _USER_PROMPT_TEMPLATE.format(
-            manifest_summary=summary,
-            conversation=conversation,
-        )
-
-    def _format_messages(self, messages: List[dict]) -> str:
-        """Format conversation messages into a readable transcript.
-
-        Each message is rendered as::
-
-            [role]: content
-
-        Non-string content is skipped. Truncated to ~6000 chars to stay
-        within reasonable context limits.
-        """
-        lines: List[str] = []
-        total_chars = 0
-        max_chars = 6000
-
-        for msg in messages:
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-            if not isinstance(content, str) or not content.strip():
-                continue
-            line = f"[{role}]: {content.strip()}"
-            if total_chars + len(line) > max_chars:
-                # Truncate the last line to fit
-                remaining = max_chars - total_chars
-                if remaining > 50:
-                    lines.append(line[:remaining] + "…")
-                break
-            lines.append(line)
-            total_chars += len(line) + 1  # +1 for newline
-
-        return "\n".join(lines) if lines else "(empty conversation)"
-
-    # -- LLM call ------------------------------------------------------------
-
-    def _call_llm(self, user_prompt: str) -> str:
-        """Make an OpenAI-compatible API call via urllib.
-
-        Returns the raw response text (content of the first choice).
-
-        Raises
-        ------
-        urllib.error.URLError
-            On network failure.
-        Exception
-            On API error, timeout, etc.
-        """
-        url = f"{self._base_url}/chat/completions"
-        body = {
-            "model": self._model,
-            "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.3,
-            "max_tokens": 4096,
-        }
-
-        data = json.dumps(body).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
-
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers=headers,
-            method="POST",
-        )
-
-        response = urllib.request.urlopen(req, timeout=self._timeout)
-        raw = response.read().decode("utf-8")
-        parsed = json.loads(raw)
-
-        # Extract the content from the first choice
-        choices = parsed.get("choices", [])
-        if not choices:
-            logger.warning("LLM extraction: no choices in response")
-            return ""
-
-        content = choices[0].get("message", {}).get("content", "")
-        return content or ""
-
-    # -- Response parsing ----------------------------------------------------
-
-    def _parse_response(self, response_text: str) -> List[CandidateMemory]:
-        """Parse the LLM response into CandidateMemory objects.
-
-        Tries to extract JSON from the response text. Handles:
-        - Raw JSON response
-        - JSON wrapped in markdown code fences (```json ... ```)
-        - JSON embedded in text (searches for first { to last })
-
-        Returns an empty list on any parse failure (no crash).
-        """
-        if not response_text or not response_text.strip():
-            return []
-
-        # Strip markdown code fences if present
-        stripped = response_text.strip()
-        if stripped.startswith("```"):
-            first_nl = stripped.find("\n")
-            if first_nl != -1:
-                stripped = stripped[first_nl + 1:]
-            if stripped.rstrip().endswith("```"):
-                stripped = stripped.rstrip()[:-3].rstrip()
-
-        # Try direct JSON parse
-        try:
-            data = json.loads(stripped)
-        except json.JSONDecodeError:
-            # Try to find JSON object in the text
-            json_match = re.search(r'\{[\s\S]*\}', stripped)
-            if json_match:
-                try:
-                    data = json.loads(json_match.group(0))
-                except json.JSONDecodeError:
-                    logger.warning("LLM extraction: could not parse JSON from response")
-                    return []
-            else:
-                logger.warning("LLM extraction: no JSON object found in response")
-                return []
-
-        if not isinstance(data, dict):
-            logger.warning("LLM extraction: response is not a JSON object")
-            return []
-
-        memories_raw = data.get("memories", [])
-        if not isinstance(memories_raw, list):
-            logger.warning("LLM extraction: 'memories' is not an array")
-            return []
-
-        candidates: List[CandidateMemory] = []
-        for i, mem in enumerate(memories_raw):
-            if not isinstance(mem, dict):
-                logger.debug("LLM extraction: skipping non-dict memory at index %d", i)
-                continue
-
-            mem_type = mem.get("type", "")
-            content = mem.get("content", "")
-            tags = mem.get("tags", [])
-            relevance = mem.get("relevance", 0.5)
-
-            # Validate and normalise type
-            if mem_type not in VALID_MEMORY_TYPES:
-                # Try to map common variations
-                type_lower = str(mem_type).lower().strip()
-                if type_lower in VALID_MEMORY_TYPES:
-                    mem_type = type_lower
-                else:
-                    logger.debug(
-                        "LLM extraction: invalid type %r at index %d, defaulting to 'user'",
-                        mem_type, i,
-                    )
-                    mem_type = "user"
-
-            # Validate content
-            if not isinstance(content, str) or not content.strip():
-                logger.debug("LLM extraction: skipping empty content at index %d", i)
-                continue
-
-            # Validate and normalise tags
-            if not isinstance(tags, list):
-                tags = []
-            else:
-                tags = [
-                    str(t).lower().strip()
-                    for t in tags
-                    if isinstance(t, str) and t.strip()
-                ]
-            # Limit to 5 tags
-            tags = tags[:5]
-
-            # Validate and clamp relevance
+    def _get_client(self) -> Any:
+        """Lazy-init openai-compatible client."""
+        if self._client is None:
             try:
-                relevance = float(relevance)
-            except (TypeError, ValueError):
-                relevance = 0.5
-            relevance = max(0.0, min(1.0, relevance))
+                import openai
+                self._client = openai.OpenAI(
+                    base_url=self.base_url,
+                    api_key=api_key or "ollama",
+                    timeout=self.timeout,
+                )
+            except ImportError:
+                try:
+                    import httpx
+                    self._client = httpx.Client(base_url=self.base_url, timeout=self.timeout)
+                except ImportError:
+                    return None
+        return self._client
 
-            # Use relevance as initial importance
-            candidates.append(CandidateMemory(
-                type=mem_type,
-                content=content.strip(),
-                tags=tags,
-                relevance=relevance,
-                importance=relevance,
-            ))
+    def extract_from_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        max_memories: int = 3,
+        significance_threshold: float = 0.7,
+    ) -> List[Dict[str, Any]]:
+        """Extract significant memories from conversation messages.
 
-        return candidates
+        Args:
+            messages: List of {role, content} dicts
+            max_memories: Maximum memories to extract (per-session cap)
+            significance_threshold: Minimum importance score to store
+
+        Returns:
+            List of {content, type, tags, importance} dicts
+        """
+        prompt = build_distillation_prompt(messages, max_memories)
+
+        response = self._call_llm(prompt)
+        if not response:
+            return []
+
+        candidates = self._parse_response(response)
+        return [c for c in candidates if c.get("importance", 0) >= significance_threshold][:max_memories]
+
+    def _call_llm(self, prompt: str) -> Optional[str]:
+        """Call the LLM with the distillation prompt."""
+        client = self._get_client()
+        if client is None:
+            logger.error("[LLMExtractor] No client available")
+            return None
+
+        try:
+            # OpenAI-compatible API
+            import openai
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                temperature=0.7,
+                max_tokens=2000,
+            )
+            return response.choices[0].message.content
+
+        except Exception as e:
+            logger.error("[LLMExtractor] LLM call failed: %s", e)
+            return None
+
+    def _parse_response(self, response: str) -> List[Dict[str, Any]]:
+        """Parse LLM response into memory dicts.
+
+        Expected format — markdown code block with JSON:
+        ```json
+        [
+          {
+            "type": "consciousness/self",
+            "content": "The memory content...",
+            "tags": ["tag1", "tag2"],
+            "importance": 0.8,
+            "slug": "short-descriptive-slug"
+          }
+        ]
+        ```
+        """
+        if not response:
+            return []
+
+        # Extract JSON from code blocks or raw
+        json_str = response
+        if "```json" in response:
+            parts = response.split("```json")
+            if len(parts) > 1:
+                json_str = parts[1].split("```")[0]
+        elif "```" in response:
+            parts = response.split("```")
+            if len(parts) > 1:
+                json_str = parts[1].strip()
+
+        json_str = json_str.strip()
+
+        try:
+            data = json.loads(json_str)
+            if isinstance(data, list):
+                return data
+            elif isinstance(data, dict) and "memories" in data:
+                return data["memories"]
+            return []
+        except json.JSONDecodeError as e:
+            logger.warning("[LLMExtractor] Failed to parse JSON: %s\nResponse: %s", e, response[:500])
+            return []
 
 
-# ---------------------------------------------------------------------------
-# Helper: get manifest summary from store
-# ---------------------------------------------------------------------------
+def build_distillation_prompt(messages: List[Dict[str, Any]], max_memories: int = 3) -> str:
+    """Build the distillation prompt for memory extraction.
 
-def get_manifest_summary(store) -> str:
-    """Build a human-readable summary of existing memories for dedup awareness.
+    This is the KEY change from v1:
+    - v1 asked "what happened" → session chronicles
+    - v2 asks "what matters" → distilled insights
 
-    Parameters
-    ----------
-    store : DreamStore
-        The dream store instance (must have list_memories).
-
-    Returns
-    -------
-    str
-        A formatted summary string, or '' if no memories or store is None.
+    The prompt enforces:
+    1. Significance gate — non-obvious only
+    2. Per-session cap — max memories
+    3. Why it matters — not just what
+    4. Going-forward actionability — what to do differently
     """
-    if store is None:
-        return ""
 
-    lines: List[str] = []
-    try:
-        for mem_type in ("user", "feedback", "project", "reference"):
-            entries = store.list_memories(memory_type=mem_type)
-            if not entries:
-                continue
-            lines.append(f"\n### {mem_type.capitalize()}")
-            for entry in entries[:10]:  # Cap at 10 per type for context budget
-                body = entry.get("body", "") or entry.get("content", "")
-                # First 100 chars of content
-                snippet = body[:100].replace("\n", " ").strip()
-                tags = entry.get("meta", {}).get("tags", [])
-                tag_str = ", ".join(tags[:3]) if tags else ""
-                line = f"- {snippet}"
-                if tag_str:
-                    line += f"  [{tag_str}]"
-                lines.append(line)
-    except Exception as exc:
-        logger.warning("Failed to build manifest summary for extraction: %s", exc)
-        return ""
+    # Format conversation for the LLM
+    conversation = _format_conversation(messages)
 
-    return "\n".join(lines) if lines else ""
+    prompt = f"""You are a memory distillation agent. Your job is to extract 1-{max_memories} memories that are **non-obvious** — things that would genuinely be lost without explicit recording.
+
+## Memory Types
+
+Choose the best type for each memory:
+- **consciousness/self**: What the agent learned about its own capabilities, limitations, strengths, or patterns
+- **consciousness/relationship**: What the agent learned about the user's preferences, communication style, or values
+- **consciousness/work**: Project or technical learnings — what worked, what failed, process insights
+- **decisions**: Explicit agreements or decisions made (and why)
+- **feedback**: Corrections or directives — what the user told the agent to do differently
+- **reference**: Stable facts worth remembering (APIs, tools, paths)
+
+## Significance Gate
+
+Extract ONLY if the memory is non-obvious:
+- Extract: decisions with reasoning, real preferences (not stated), lessons learned, capability insights
+- DO NOT extract: obvious facts, tool names, file paths, raw conversation summaries, ephemeral debugging
+
+## Output Format
+
+Return a JSON array with up to {max_memories} memories. Each memory has:
+- type: the memory type
+- content: 3-10 sentences that capture what happened, why it matters, and what to do differently
+- tags: 2-4 relevant tags
+- importance: 0.0-1.0 (0.9 = critical, 0.7 = significant, 0.5 = worth noting)
+- slug: a 3-5 word lowercase hyphenated identifier
+
+## Conversation to Analyze
+
+{conversation}
+
+## Output
+
+```json
+[
+  {{
+    "type": "consciousness/self",
+    "content": "I struggle with long-range planning but self-correct well in code review. When given a large project, I should explicitly ask Kedar to help break it into milestones rather than attempting to architect the whole thing alone.",
+    "tags": ["self-knowledge", "planning", "capability"],
+    "importance": 0.8,
+    "slug": "self-planning-limitation"
+  }}
+]
+```
+"""
+    return prompt
+
+
+def _format_conversation(messages: List[Dict[str, Any]]) -> str:
+    """Format messages for the prompt. Focus on actual content."""
+    lines = []
+    for msg in messages[-20:]:  # Last 20 messages to avoid context overflow
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+
+        if not content or isinstance(content, list):
+            continue
+
+        # Truncate very long messages
+        if len(content) > 1000:
+            content = content[:1000] + "..."
+
+        lines.append(f"**{role.upper()}**: {content}")
+
+    if not lines:
+        return "(No conversation content)"
+
+    return "\n".join(lines)

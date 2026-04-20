@@ -1,58 +1,44 @@
-"""Dream Memory Provider — AutoDream-inspired memory consolidation plugin.
+"""Dream v2 Memory Provider — Agent Consciousness Plugin.
 
-Implements the MemoryProvider ABC to give the agent structured markdown
-memories with taxonomy, manifest-based recall, and (Phase 2) per-turn
-extraction, memory-write mirroring, and pre-compress rescue.
+A memory provider plugin that gives the agent an accumulated self-model —
+the persistent layer that makes Garuda feel continuous across sessions.
+
+This is NOT a skill — it's firmware settings / consciousness.
+Starts minimal, grows over time.
+
+Vault structure:
+  /consciousness/self/     — what the agent knows about itself
+  /consciousness/relationship/  — learnings about the user
+  /consciousness/work/    — project/tactical learnings
+  /decisions/             — explicit agreements and decisions
+  /feedback/              — corrections and directives
+  /reference/             — stable facts: APIs, tools, paths
 
 Config in $HERMES_HOME/config.yaml:
   plugins:
-    dream:
-      vault_path: $HERMES_HOME/dream_vault   # omit to use default
-      max_lines: 100                          # per-memory line limit
-      max_bytes: 50000                        # per-memory byte limit
-      consolidate_model: ""                   # LLM model for Phase 4
-      consolidate_cron: "0 3 * * *"           # cron for Phase 4
-      taxonomy: true                          # enable taxonomy subdirs
-
-Phase 3 adds:
-  - dream_recall: manifest-based memory retrieval (no vector search)
-  - dream_consolidate: stub for Phase 4 consolidation engine
-  - prefetch / queue_prefetch: per-turn context injection
-  - Updated system_prompt_block with vault status
+    dream_v2:
+      vault_path: /path/to/vault
+      extraction_model: glm-5.1:agentic
+      consolidation_model: glm-5.1:agentic
+      extraction_mode: llm
+      hybrid_mode: true
+      max_memories_per_session: 3
+      significance_threshold: 0.7
+      max_lines_per_file: 200
+      auto_recall: false
+      consolidation_mode: manual
 """
 
 from __future__ import annotations
 
-import json
 import logging
+import threading
 from pathlib import Path
-from collections import OrderedDict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
-from tools.registry import tool_error
-from .shared import load_dream_config as _load_plugin_config, resolve_vault_path as _resolve_vault_path
-from .store import DreamStore
-from .taxonomy import MEMORY_TYPES
-from .extract import (
-    CandidateMemory,
-    extract_candidates,
-    extract_candidates_from_messages,
-    build_pre_compress_summary,
-)
-from .extract_llm import LLMExtractor, get_manifest_summary
-from .recall import RecallEngine
-from .consolidation import run_consolidation
-from .consolidation import ConsolidationLock, ConsolidationLockError
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Cron job constants
-# ---------------------------------------------------------------------------
-
-_DREAM_CRON_JOB_NAME = "dream-consolidation"
-_DREAM_CRON_JOB_SKILL = "dream"
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +48,7 @@ _DREAM_CRON_JOB_SKILL = "dream"
 DREAM_STATUS_SCHEMA = {
     "name": "dream_status",
     "description": (
-        "Show Dream Memory vault statistics — count of memories per type, "
+        "Show Dream consciousness vault statistics — count of memories per type, "
         "total memories, and vault path."
     ),
     "parameters": {
@@ -75,25 +61,29 @@ DREAM_STATUS_SCHEMA = {
 DREAM_RECALL_SCHEMA = {
     "name": "dream_recall",
     "description": (
-        "Recall relevant memories from the Dream vault using manifest-based "
-        "selection. Scans memory frontmatter to find matches for the current "
-        "query, returns top results by relevance."
+        "Recall relevant memories from the Dream consciousness vault. "
+        "Scans manifest for tag + keyword matches, returns top results scored by "
+        "relevance, recency, and importance.\n\n"
+        "Use when: answering questions about past agreements, looking up user "
+        "preferences, finding technical decisions, or checking what the agent "
+        "has learned about itself or its work.\n\n"
+        "Do NOT use for: session search (use session_search tool instead)."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "What to search for",
+                "description": "What to search for — keywords, tags, or concepts",
             },
             "memory_type": {
                 "type": "string",
-                "enum": ["user", "feedback", "project", "reference"],
-                "description": "Filter by memory type",
+                "description": "Filter by memory type: consciousness/self, consciousness/relationship, consciousness/work, decisions, feedback, or reference",
+                "enum": ["consciousness/self", "consciousness/relationship", "consciousness/work", "decisions", "feedback", "reference"],
             },
             "limit": {
                 "type": "integer",
-                "description": "Max results (default: 5)",
+                "description": "Max results (default: 5, max: 20)",
             },
         },
         "required": ["query"],
@@ -103,941 +93,388 @@ DREAM_RECALL_SCHEMA = {
 DREAM_CONSOLIDATE_SCHEMA = {
     "name": "dream_consolidate",
     "description": (
-        "Trigger memory consolidation (the 'dream' cycle). Runs Orient → "
-        "Gather → Consolidate → Prune phases. Usually triggered by cron, "
-        "but can be called on-demand to clean up fragmented or oversized "
-        "memories."
+        "Run Dream consolidation: audit the vault, merge duplicates, prune "
+        "stale entries, and rebuild the MEMORY.md index. "
+        "Manual trigger only — not needed frequently."
     ),
     "parameters": {
         "type": "object",
-        "properties": {
-            "dry_run": {
-                "type": "boolean",
-                "description": "Preview changes without writing (default: false)",
-            },
-            "memory_type": {
-                "type": "string",
-                "enum": ["user", "feedback", "project", "reference"],
-                "description": "Consolidate only this type",
-            },
-        },
+        "properties": {},
+        "required": [],
     },
 }
 
 
 # ---------------------------------------------------------------------------
-# Relevance threshold for auto-store (candidates below this are logged only)
+# Memory Provider implementation
 # ---------------------------------------------------------------------------
 
-_MIN_RELEVANCE = 0.6
+class DreamV2MemoryProvider(MemoryProvider):
+    """Memory provider implementing Dream v2 consciousness architecture."""
 
-# Valid extraction modes for on_session_end
-_VALID_EXTRACTION_MODES = {"regex", "llm", "both"}
+    def __init__(self, config: Dict[str, Any]):
+        # Don't call parent __init__ — ABC abstract
+        self._config = config
+        self._vault_path = Path(config.get("vault_path", str(Path.home() / ".hermes" / "dream_v2")))
+        self._max_per_session = int(config.get("max_memories_per_session", 3))
+        self._significance_threshold = float(config.get("significance_threshold", 0.7))
+        self._hybrid_mode = config.get("hybrid_mode", True)
+        self._extraction_model = config.get("extraction_model", "glm-5.1:agentic")
+        self._extraction_mode = config.get("extraction_mode", "llm")
+        self._max_lines = int(config.get("max_lines_per_file", 200))
+        self._auto_recall = config.get("auto_recall", False)
 
+        # Thread safety
+        self._lock = threading.RLock()
 
-# ---------------------------------------------------------------------------
-# DreamMemoryProvider
-# ---------------------------------------------------------------------------
+        # Components (lazy init)
+        self._store = None
+        self._extractor = None
+        self._recall = None
+        self._staging = None
 
-class DreamMemoryProvider(MemoryProvider):
-    """Dream Memory provider — structured markdown memories with taxonomy."""
+        # Per-session tracking
+        self._session_extracted_count = 0
+        self._session_id: Optional[str] = None
+        self._initialized = False
 
-    def __init__(self, config: dict | None = None):
-        self._config = config or _load_plugin_config()
-        self._store: DreamStore | None = None
-        self._session_id: str = ""
-        self._recall_engine: RecallEngine | None = None
-        self._prefetch_cache: OrderedDict[str, str] = OrderedDict()
-        self._prefetch_cache_max: int = 50
-        self._pending_prefetch_query: str = ""
-        self._auto_recall_budget: int = int(self._config.get("auto_recall_budget", 2048))
-        self._auto_recall_top_k: int = int(self._config.get("auto_recall_top_k", 10))
+        # Discord context (captured from gateway_session_key during initialize)
+        self._discord_context: str = "unknown"
+        self._platform: str = "unknown"
 
-        # Extraction mode: regex (fast), llm (quality), or both
-        self._extraction_mode: str = self._config.get("extraction_mode", "llm").lower()
-        if self._extraction_mode not in _VALID_EXTRACTION_MODES:
-            logger.warning(
-                "Invalid extraction_mode %r, defaulting to 'llm'",
-                self._extraction_mode,
-            )
-            self._extraction_mode = "llm"
-
-        # LLM extractor (created lazily, only when needed)
-        self._llm_extractor: LLMExtractor | None = None
-        if self._extraction_mode in ("llm", "both"):
-            self._llm_extractor = LLMExtractor(self._config)
+    # ─── MemoryProvider ABC ───────────────────────────────────────────────
 
     @property
     def name(self) -> str:
-        return "dream"
-
-    # -- Core lifecycle ------------------------------------------------------
+        return "dream_v2"
 
     def is_available(self) -> bool:
-        """Dream is always available — it only needs the filesystem."""
-        return True
+        """Always available if vault is accessible."""
+        return self._vault_path.exists()
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        self._store = DreamStore(_resolve_vault_path(self._config), config=self._config)
-        self._store.initialize()
+        """Called at agent startup. Initialize components."""
         self._session_id = session_id
-        self._recall_engine = RecallEngine(self._store)
+        self._session_extracted_count = 0
+        self._initialized = True
 
-        # Track session count for consolidation gate
-        self._store.increment_session_counter()
+        # Capture platform for Discord context tagging
+        self._platform = kwargs.get("platform", "unknown")
 
-        logger.info("Dream Memory initialised — vault at %s", self._store.vault_path)
+        # Parse gateway_session_key to extract Discord context
+        # Format: agent:main:discord:{type}:{ids...}
+        # Examples:
+        #   agent:main:discord:thread:123:456      -> discord:thread:123:456
+        #   agent:main:discord:group:123           -> discord:group:123
+        #   agent:main:discord:dm:789               -> discord:dm:789
+        #   agent:main:cli:default                  -> cli:default
+        gsk = kwargs.get("gateway_session_key", "")
+        self._discord_context = self._parse_discord_context(gsk)
+
+        # Lazy init components (import heavy modules only when needed)
+        from .store import DreamStore
+        from .extract_llm import LLMExtractor
+        from .recall import RecallEngine
+        from .staging import StagingManager
+
+        self._store = DreamStore(str(self._vault_path))
+        self._extractor = LLMExtractor(
+            model=self._extraction_model,
+            api_key=self._config.get("api_key"),
+            base_url=self._config.get("extraction_base_url"),
+            timeout=int(self._config.get("extraction_timeout", 120)),
+        )
+        self._recall = RecallEngine(str(self._vault_path))
+        self._staging = StagingManager(str(self._vault_path))
+
+        # Bug #6 workaround: merge any staging from pre-compress rescue
+        self._staging.merge_to_vault()
+
+        logger.info("[Dream v2] Initialized at %s", self._vault_path)
 
     def system_prompt_block(self) -> str:
-        if not self._store:
+        """Return MEMORY.md index for system prompt injection at session start."""
+        try:
+            index_path = self._vault_path / "MEMORY.md"
+            if index_path.exists():
+                content = index_path.read_text().strip()
+                if content:
+                    header = "══════════════════════════════════════DREAM MEMORY INDEX══════════════════════════════════════"
+                    return f"{header}\n{content}\n"
+        except Exception as e:
+            logger.warning("[Dream v2] Failed to read MEMORY.md: %s", e)
+        return ""
+
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+        """Called after every conversation turn. Lightweight — no-op for v2.
+
+        Extraction happens at session end, not per turn.
+        """
+        pass
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Return relevant memory context for the upcoming turn. On-demand only."""
+        if not self._auto_recall:
             return ""
-        stats = self._store.stats()
-        total = stats["total"]
-        if total == 0:
-            return (
-                "Dream Memory active. Empty vault — memories will be captured "
-                "from conversations. Use dream_recall for targeted queries."
-            )
-        counts = stats["counts"]
-        u = counts.get("user", 0)
-        f = counts.get("feedback", 0)
-        p = counts.get("project", 0)
-        r = counts.get("reference", 0)
+        if not self._recall:
+            return ""
 
-        parts = [f"Dream Memory active. {total} memories stored ({u}U/{f}F/{p}P/{r}R)."]
-        parts.append("Use dream_recall for targeted queries.")
+        try:
+            results = self._recall.recall(query, limit=5)
+            if not results:
+                return ""
 
-        # If auto_recall is enabled, mention passive availability
-        auto_recall = self._config_as_bool("auto_recall")
-        if auto_recall:
-            parts.append("Relevant memories are automatically injected each turn.")
-
-        return " ".join(parts)
-
-    # -- Tools ---------------------------------------------------------------
+            blocks = ["## Dream Memory Recall"]
+            for r in results:
+                mem = r.memory
+                content = mem.get("content", "")[:500]
+                if content:
+                    blocks.append(f"**[{mem.get('type', '?')}]** {content}")
+            return "\n\n".join(blocks)
+        except Exception as e:
+            logger.warning("[Dream v2] prefetch failed: %s", e)
+            return ""
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        """Return tool schemas for dream tools."""
         return [DREAM_STATUS_SCHEMA, DREAM_RECALL_SCHEMA, DREAM_CONSOLIDATE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        """Handle dream_* tool calls."""
+        if not self._initialized:
+            self.initialize(args.get("session_id", "unknown"))
+
         if tool_name == "dream_status":
-            return self._handle_dream_status(args)
+            return self._tool_status()
         elif tool_name == "dream_recall":
-            return self._handle_dream_recall(args)
+            return self._tool_recall(
+                query=args.get("query", ""),
+                memory_type=args.get("memory_type"),
+                limit=int(args.get("limit", 5)),
+            )
         elif tool_name == "dream_consolidate":
-            return self._handle_dream_consolidate(args)
-        return tool_error(f"Unknown tool: {tool_name}")
-
-    def _handle_dream_status(self, args: dict) -> str:
-        if not self._store:
-            return json.dumps({"error": "Dream store not initialised"})
-        stats = self._store.stats()
-        return json.dumps(stats)
-
-    def _handle_dream_recall(self, args: dict) -> str:
-        """Handle dream_recall tool call."""
-        if not self._store or not self._recall_engine:
-            return json.dumps({"error": "Dream store not initialised"})
-
-        query = args.get("query", "")
-        memory_type = args.get("memory_type")
-        limit = args.get("limit", 5)
-        if isinstance(limit, str):
-            try:
-                limit = int(limit)
-            except ValueError:
-                limit = 5
-
-        if not query or not query.strip():
-            return json.dumps({"error": "query is required", "results": []})
-
-        results = self._recall_engine.recall(
-            query=query,
-            memory_type=memory_type,
-            limit=limit,
-        )
-
-        # Format results for tool response
-        out = []
-        for r in results:
-            out.append({
-                "memory_type": r.memory_type,
-                "filename": r.filename,
-                "content": r.content[:500],  # truncate for tool response
-                "tags": r.frontmatter.get("tags", []),
-                "relevance": r.frontmatter.get("relevance", 0.5),
-                "score": r.score,
-            })
-
-        return json.dumps({"query": query, "results": out})
-
-    def _handle_dream_consolidate(self, args: dict) -> str:
-        """Run the 4-phase consolidation cycle (Orient → Gather → Consolidate → Prune)."""
-        if not self._store:
-            return json.dumps({"error": "Dream store not initialised"})
-
-        dry_run = args.get("dry_run", False)
-        memory_type = args.get("memory_type")
-
-        consolidation_config = {
-            "max_lines": self._config.get("max_lines", 100),
-            "max_bytes": self._config.get("max_bytes", 50000),
-            "consolidation_mode": self._config.get("consolidation_mode", "deterministic"),
-            "consolidate_model": self._config.get("consolidate_model", ""),
-            "consolidate_api_key": self._config.get("consolidate_api_key", ""),
-            "consolidate_base_url": self._config.get("consolidate_base_url", ""),
-        }
-
-        try:
-            result = run_consolidation(
-                store=self._store,
-                config=consolidation_config,
-                dry_run=dry_run,
-                memory_type=memory_type,
-            )
-        except Exception as exc:
-            logger.error("Dream consolidation failed: %s", exc)
-            return json.dumps({"error": str(exc), "status": "failed"})
-
-        # Build action log for tool response
-        action_log = []
-        for action in result.consolidate.actions:
-            action_log.append({
-                "action": action.action,
-                "target_type": action.target_type,
-                "target_files": action.target_files,
-                "result_file": action.result_file,
-                "details": action.details,
-            })
-
-        response = {
-            "status": "completed" if not dry_run else "dry_run",
-            "dry_run": dry_run,
-            "memory_type": memory_type,
-            "orient": {
-                "needs_consolidation": result.orient.needs_consolidation,
-                "reason": result.orient.reason,
-                "stale_files": len(result.orient.stale_files),
-                "oversized_files": len(result.orient.oversized_files),
-            },
-            "gather": {
-                "entries_loaded": result.gather.stats.get("entries_loaded", 0),
-                "groups_found": result.gather.stats.get("groups_found", 0),
-                "duplicates_found": result.gather.stats.get("duplicates_found", 0),
-                "contradictions_found": result.gather.stats.get("contradictions_found", 0),
-            },
-            "consolidate": {
-                "total_actions": len(action_log),
-                "merged": result.consolidate.merged_count,
-                "deduped": result.consolidate.deduped_count,
-                "contradictions_resolved": result.consolidate.pruned_count,
-                "actions": action_log,
-            },
-            "prune": {
-                "deleted_files": len(result.prune.deleted_files),
-                "capped_files": len(result.prune.capped_files),
-                "manifest_updated": result.prune.manifest_updated,
-            },
-        }
-
-        logger.info(
-            "Dream consolidation: %s — %d actions (%d merges, %d dedupes, %d contradictions)",
-            "dry-run" if dry_run else "completed",
-            len(action_log),
-            result.consolidate.merged_count,
-            result.consolidate.deduped_count,
-            result.consolidate.pruned_count,
-        )
-
-        return json.dumps(response, default=str)
-
-    # -- Optional hooks (Phase 2 implementations) --------------------------
-
-    def _config_as_bool(self, key: str) -> bool:
-        """Read a config key as a boolean, handling string 'true'/'false'."""
-        val = self._config.get(key, False)
-        if isinstance(val, bool):
-            return val
-        if isinstance(val, str):
-            return val.lower() in ("true", "1", "yes")
-        return bool(val)
-
-    def should_auto_recall(self) -> bool:
-        """Return True if auto-recall (passive memory injection) is enabled.
-
-        When True, MemoryManager should inject prefetch results into every
-        turn's context. When False (default), prefetch results are only
-        available via explicit dream_recall tool calls.
-        """
-        return self._config_as_bool("auto_recall")
-
-    def prefetch(self, query: str, *, session_id: str = "", budget: int = None) -> str:
-        """Phase 3 manifest-based recall for context injection.
-
-        Returns a formatted context block with relevant memories,
-        capped to the configured budget (default 2048 bytes).
-
-        This method is called by MemoryManager.prefetch_all() every turn.
-        When auto_recall is disabled (default: False), this method still
-        works but the results are only consumed when the agent explicitly
-        calls dream_recall. MemoryManager.inject_auto_recall() handles
-        the gating of whether to include prefetch results in the user message.
-        When auto_recall is enabled, context is passively injected every turn.
-        """
-        if not self._store or not self._recall_engine:
-            return ""
-
-        budget = budget or self._auto_recall_budget
-
-        # Check cache
-        cache_key = f"{session_id}:{query}"
-        if cache_key in self._prefetch_cache:
-            return self._prefetch_cache[cache_key]
-
-        try:
-            # Get more candidates than we need, then trim to budget
-            results = self._recall_engine.recall(query, limit=self._auto_recall_top_k)
-        except Exception as exc:
-            logger.warning("Dream prefetch recall failed: %s", exc)
-            return ""
-
-        if not results:
-            if len(self._prefetch_cache) >= self._prefetch_cache_max:
-                self._prefetch_cache.popitem(last=False)
-            self._prefetch_cache[cache_key] = ""
-            return ""
-
-        # Build output, prioritizing feedback type, then by score
-        # Sort: feedback first, then by score descending
-        sorted_results = sorted(results, key=lambda r: (0 if r.memory_type == "feedback" else 1, -r.score))
-
-        lines = ["## Dream Memory"]
-        current_size = len("## Dream Memory\n")
-        type_labels = {"user": "User", "feedback": "Feedback", "project": "Project", "reference": "Reference"}
-
-        for r in sorted_results:
-            label = type_labels.get(r.memory_type, r.memory_type.capitalize())
-            prefix = "↳" if getattr(r, 'is_related', False) else "•"
-            snippet = r.content[:150].replace("\n", " ").strip()
-            if len(r.content) > 150:
-                snippet += "…"
-            line = f"{prefix} **{label}** ({r.score:.2f}): {snippet}"
-            line_size = len(line) + 1  # +1 for newline
-
-            if current_size + line_size > budget:
-                break  # Budget exceeded
-
-            lines.append(line)
-            current_size += line_size
-
-        if len(lines) == 1:  # Only the header
-            if len(self._prefetch_cache) >= self._prefetch_cache_max:
-                self._prefetch_cache.popitem(last=False)
-            self._prefetch_cache[cache_key] = ""
-            return ""
-
-        block = "\n".join(lines) + "\n"
-        if len(self._prefetch_cache) >= self._prefetch_cache_max:
-            self._prefetch_cache.popitem(last=False)
-        self._prefetch_cache[cache_key] = block
-        return block
-
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Store the query for background pre-computation next turn."""
-        self._pending_prefetch_query = query
-
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Extract candidate memories from a completed turn and store them.
-
-        Calls :func:`extract_candidates` on the turn content, then writes
-        any candidate with relevance >= 0.6 to the dream store.
-        """
-        if not self._store:
-            return
-
-        try:
-            candidates = extract_candidates(user_content, assistant_content)
-            if not candidates:
-                return
-
-            stored = 0
-            for c in candidates:
-                if c.relevance >= _MIN_RELEVANCE:
-                    self._store.add_memory(
-                        memory_type=c.type,
-                        content=c.content,
-                        tags=c.tags,
-                        source=session_id or self._session_id,
-                        relevance=c.relevance,
-                        importance=c.importance,
-                    )
-                    stored += 1
-
-            logger.info(
-                "Dream sync_turn: extracted %d candidates, stored %d (threshold=%.1f)",
-                len(candidates), stored, _MIN_RELEVANCE,
-            )
-        except Exception as exc:
-            logger.warning("Dream sync_turn failed: %s", exc)
-
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
-        """Mirror built-in memory writes to dream taxonomy format.
-
-        Ensures the dream vault stays in sync with MEMORY.md / USER.md writes.
-
-        Parameters
-        ----------
-        action:
-            ``add``, ``replace``, or ``remove``.
-        target:
-            ``memory`` (MEMORY.md) or ``user`` (USER.md).
-        content:
-            The written content string.
-        """
-        if not self._store:
-            return
-
-        try:
-            if action == "add":
-                # Map target to dream memory type
-                mem_type = "user" if target == "user" else "project"
-                self._store.add_memory(
-                    memory_type=mem_type,
-                    content=content,
-                    tags=["builtin-mirror"],
-                    source=self._session_id,
-                    relevance=0.8,
-                )
-                logger.debug("Dream on_memory_write: add %s → %s", target, mem_type)
-
-            elif action == "replace":
-                # Find the closest existing dream memory by content match and update it
-                mem_type = "user" if target == "user" else "project"
-                matching = self._store.list_memories(memory_type=mem_type)
-                best_match = None
-                best_similarity = 0.0
-                content_norm = content.strip().lower()
-                for entry in matching:
-                    body_norm = entry.get("body", "").strip().lower()
-                    # Exact match first
-                    if content_norm == body_norm:
-                        best_match = entry
-                        best_similarity = 1.0
-                        break
-                    # Jaccard word overlap similarity for near-matches
-                    content_words = set(content_norm.split())
-                    body_words = set(body_norm.split())
-                    if content_words and body_words:
-                        intersection = content_words & body_words
-                        union = content_words | body_words
-                        similarity = len(intersection) / len(union)
-                        if similarity > best_similarity and similarity > 0.8:
-                            best_similarity = similarity
-                            best_match = entry
-                if best_match:
-                    filename = best_match.get("filename", "")
-                    if filename:
-                        self._store.update_memory(
-                            mem_type,
-                            filename,
-                            content=content,
-                            tags=["builtin-mirror", "replaced"],
-                        )
-                        logger.debug(
-                            "Dream on_memory_write: replaced %s/%s (similarity=%.2f)",
-                            mem_type, filename, best_similarity,
-                        )
-                        return  # replace first match only
-                # If no match found, add as new
-                self._store.add_memory(
-                    memory_type=mem_type,
-                    content=content,
-                    tags=["builtin-mirror"],
-                    source=self._session_id,
-                    relevance=0.8,
-                )
-                logger.debug("Dream on_memory_write: replace (no match) → add %s", mem_type)
-
-            elif action == "remove":
-                # Find and delete matching dream memories
-                removed = 0
-                for mem_type in MEMORY_TYPES:
-                    matching = self._store.list_memories(memory_type=mem_type)
-                    for entry in matching:
-                        if content.strip().lower() in entry.get("body", "").strip().lower():
-                            filename = entry.get("filename", "")
-                            if filename:
-                                self._store.delete_memory(mem_type, filename)
-                                removed += 1
-                if removed:
-                    logger.debug("Dream on_memory_write: removed %d matching memories", removed)
-
-        except Exception as exc:
-            logger.warning("Dream on_memory_write failed: %s", exc)
-
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Extract candidate memories from all messages at session end.
-
-        Behaviour depends on ``extraction_mode`` config key:
-          - ``regex``: Use regex-based extraction only (legacy behaviour).
-          - ``llm``: Use LLM-powered extraction only (default, higher quality).
-            Falls back to regex if the LLM call fails (no API key, timeout, etc).
-          - ``both``: Run both extractors and merge results.
-        """
-        if not self._store or not messages:
-            return
-
-        try:
-            all_candidates: List[CandidateMemory] = []
-            mode = self._extraction_mode
-            llm_candidates: List[CandidateMemory] = []
-
-            if mode in ("regex", "both"):
-                regex_candidates = extract_candidates_from_messages(messages)
-                all_candidates.extend(regex_candidates)
-
-            if mode in ("llm", "both") and self._llm_extractor is not None:
-                manifest_summary = get_manifest_summary(self._store)
-                llm_candidates = self._llm_extractor.extract(
-                    session_id=self._session_id,
-                    messages=messages,
-                    manifest_summary=manifest_summary,
-                )
-                all_candidates.extend(llm_candidates)
-
-                # Fallback: if LLM returned nothing and we haven't run regex,
-                # fall back to regex extraction so we don't lose the session
-                if mode == "llm" and not llm_candidates:
-                    logger.info(
-                        "Dream on_session_end: LLM extraction produced no results, "
-                        "falling back to regex extraction"
-                    )
-                    regex_candidates = extract_candidates_from_messages(messages)
-                    all_candidates.extend(regex_candidates)
-                    mode = "regex"  # Update mode tagging to reflect regex source
-            elif mode == "llm":
-                # LLM extractor is None (shouldn't normally happen, but be safe)
-                # Fall back to regex
-                logger.warning(
-                    "Dream on_session_end: LLM extractor not available, "
-                    "falling back to regex extraction"
-                )
-                regex_candidates = extract_candidates_from_messages(messages)
-                all_candidates.extend(regex_candidates)
-                mode = "regex"
-
-            if not all_candidates:
-                return
-
-            # Deduplicate candidates by normalised content + type
-            seen = set()
-            unique_candidates: List[CandidateMemory] = []
-            # Track LLM-sourced content for tagging
-            llm_keys = set()
-            if mode == "both":
-                for c in llm_candidates:
-                    llm_keys.add((c.type, c.content.strip().lower()))
-            elif mode == "llm":
-                # All candidates are LLM-sourced
-                for c in all_candidates:
-                    llm_keys.add((c.type, c.content.strip().lower()))
-
-            for c in all_candidates:
-                key = (c.type, c.content.strip().lower())
-                if key not in seen:
-                    seen.add(key)
-                    unique_candidates.append(c)
-
-            stored = 0
-            for c in unique_candidates:
-                if c.relevance >= _MIN_RELEVANCE:
-                    c_tags = list(c.tags)
-                    key = (c.type, c.content.strip().lower())
-                    if key in llm_keys:
-                        c_tags.append("session-end-llm")
-                    else:
-                        c_tags.append("session-end")
-
-                    self._store.add_memory(
-                        memory_type=c.type,
-                        content=c.content,
-                        tags=c_tags,
-                        source=self._session_id,
-                        relevance=c.relevance,
-                        importance=c.importance,
-                    )
-                    stored += 1
-
-            logger.info(
-                "Dream on_session_end (mode=%s): extracted %d candidates, stored %d",
-                mode, len(unique_candidates), stored,
-            )
-        except Exception as exc:
-            logger.warning("Dream on_session_end failed: %s", exc)
-
-    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        """Extract insights from messages about to be compressed.
-
-        Returns a summary string for the compressor to preserve.  Also
-        writes any new candidates to the dream store.
-        """
-        if not messages:
-            return ""
-
-        try:
-            # Build the compression-preservation summary
-            summary = build_pre_compress_summary(messages)
-
-            # Also persist high-confidence candidates to store
-            if self._store:
-                candidates = extract_candidates_from_messages(messages)
-                stored = 0
-                for c in candidates:
-                    if c.relevance >= _MIN_RELEVANCE:
-                        self._store.add_memory(
-                            memory_type=c.type,
-                            content=c.content,
-                            tags=c.tags + ["pre-compress"],
-                            source=self._session_id,
-                            relevance=c.relevance,
-                            importance=c.importance,
-                        )
-                        stored += 1
-                if stored:
-                    logger.info(
-                        "Dream on_pre_compress: stored %d candidates from %d messages",
-                        stored, len(messages),
-                    )
-
-            return summary
-        except Exception as exc:
-            logger.warning("Dream on_pre_compress failed: %s", exc)
-            return ""
+            return self._tool_consolidate()
+        return f'{{"error": "Unknown dream tool: {tool_name}"}}'
 
     def shutdown(self) -> None:
         """Clean shutdown."""
-        self._store = None
-        self._recall_engine = None
+        pass
 
-    # -- Cron integration ---------------------------------------------------
+    # ─── Optional hooks ───────────────────────────────────────────────────
 
-    def setup_cron(self) -> dict:
-        """Create or update a Hermes cron job for nightly dream consolidation.
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Called at session end. Extract significant memories."""
+        if not messages or not self._initialized:
+            return
 
-        Uses the ``consolidate_cron`` config key (default ``0 3 * * *``) to
-        determine the schedule.  The job uses the ``dream`` skill with a
-        self-contained prompt that triggers consolidation.
+        if self._extraction_mode == "llm":
+            self._extract_llm(messages)
+        elif self._extraction_mode == "regex":
+            self._extract_regex(messages)
 
-        Returns
-        -------
-        dict
-            The created job dict (from ``cron.jobs.create_job``), or an
-            error dict on failure.
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Called before context compression. Rescue unstored memories.
+
+        Bug #6 workaround: upstream silently discards our return value.
+        We write to a staging file. Next initialize() merges it.
         """
-        from hermes_constants import get_hermes_home
+        if not self._hybrid_mode or not self._initialized:
+            return ""
 
-        schedule = self._config.get("consolidate_cron", "0 3 * * *").strip()
-        if not schedule:
-            schedule = "0 3 * * *"
+        if self._session_extracted_count >= self._max_per_session:
+            return ""
 
         try:
-            from cron.jobs import create_job, list_jobs
-
-            # Remove any existing dream consolidation job first (idempotent setup)
-            remove_consolidation_cron(str(get_hermes_home()))
-
-            job = create_job(
-                prompt=(
-                    "Run the nightly Dream Memory consolidation cycle. "
-                    "Use the dream_consolidate tool to perform Orient → "
-                    "Gather → Consolidate → Prune on all memory types. "
-                    "Report a brief summary of actions taken."
-                ),
-                schedule=schedule,
-                name=_DREAM_CRON_JOB_NAME,
-                skills=[_DREAM_CRON_JOB_SKILL],
+            candidates = self._extractor.extract_from_messages(
+                messages,
+                max_memories=1,
+                significance_threshold=self._significance_threshold,
             )
-            logger.info(
-                "Dream cron job created: id=%s schedule='%s'",
-                job.get("id", "?"),
-                schedule,
-            )
-            return job
+            if candidates:
+                self._staging.write_candidates(candidates, self._session_id or "unknown")
+                logger.info("[Dream v2] Pre-compress rescue: wrote %d candidates", len(candidates))
+        except Exception as e:
+            logger.warning("[Dream v2] Pre-compress rescue failed: %s", e)
 
-        except Exception as exc:
-            logger.error("Dream setup_cron failed: %s", exc)
-            return {"error": str(exc), "status": "failed"}
+        return ""
 
-    def remove_cron(self) -> dict:
-        """Remove the dream consolidation cron job if it exists.
+    # ─── Extraction ─────────────────────────────────────────────────────
 
-        Returns
-        -------
-        dict
-            ``{"removed": True}`` if a job was found and removed, or
-            ``{"removed": False, "reason": "..."}`` otherwise.
-        """
-        from hermes_constants import get_hermes_home
+    def _extract_llm(self, messages: List[Dict[str, Any]]) -> None:
+        """LLM-powered extraction at session end."""
+        if self._session_extracted_count >= self._max_per_session:
+            return
 
-        result = remove_consolidation_cron(str(get_hermes_home()))
-        if result:
-            logger.info("Dream cron job removed.")
-            return {"removed": True}
-        else:
-            logger.info("No dream cron job found to remove.")
-            return {"removed": False, "reason": "no matching job found"}
+        with self._lock:
+            try:
+                candidates = self._extractor.extract_from_messages(
+                    messages,
+                    max_memories=self._max_per_session - self._session_extracted_count,
+                    significance_threshold=self._significance_threshold,
+                )
 
-    def cron_status(self) -> dict:
-        """Check whether a dream consolidation cron job exists.
+                for candidate in candidates:
+                    path = self._store.add_memory(
+                        content=candidate["content"],
+                        memory_type=candidate["type"],
+                        tags=candidate.get("tags", []),
+                        source=self._discord_context,
+                        importance=candidate.get("importance", 0.5),
+                    )
+                    if path:
+                        self._session_extracted_count += 1
+                        logger.info("[Dream v2] Stored: %s", path.name)
 
-        Returns
-        -------
-        dict
-            Status info including ``enabled``, ``schedule``, and ``next_run_at``
-            if a job is found, or ``{"exists": False}`` otherwise.
-        """
+                self._store.rebuild_index()
+            except Exception as e:
+                logger.error("[Dream v2] Extraction failed: %s", e)
+
+    def _extract_regex(self, messages: List[Dict[str, Any]]) -> None:
+        """Fast regex-based extraction. Fallback when LLM unavailable."""
+        from .extract import extract_candidates_from_messages
+        with self._lock:
+            try:
+                candidates = extract_candidates_from_messages(messages)
+                for candidate in candidates:
+                    if self._session_extracted_count >= self._max_per_session:
+                        break
+                    path = self._store.add_memory(
+                        content=candidate["content"],
+                        memory_type=candidate.get("type", "reference"),
+                        tags=candidate.get("tags", []),
+                        source=self._discord_context,
+                        importance=candidate.get("importance", 0.3),
+                    )
+                    if path:
+                        self._session_extracted_count += 1
+                self._store.rebuild_index()
+            except Exception as e:
+                logger.error("[Dream v2] Regex extraction failed: %s", e)
+
+    # ─── Tool handlers ───────────────────────────────────────────────────
+
+    def _tool_status(self) -> str:
+        """Return vault statistics."""
         try:
-            from cron.jobs import list_jobs
+            stats = self._store.get_stats()
+            lines = [
+                "## Dream v2 — Consciousness Vault",
+                f"**Vault:** `{self._vault_path}`",
+                f"**Total memories:** {stats['total']}",
+                "",
+            ]
+            for type_name, count in stats.get("by_type", {}).items():
+                lines.append(f"  {type_name}: {count}")
+            lines.extend([
+                "",
+                f"**Session extracted:** {self._session_extracted_count}/{self._max_per_session}",
+                f"**Per-session cap:** {self._max_per_session}",
+                f"**Auto-recall:** {'enabled' if self._auto_recall else 'disabled (on-demand)'}",
+            ])
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Dream status error: {e}"
 
-            for job in list_jobs(include_disabled=True):
-                if job.get("name") == _DREAM_CRON_JOB_NAME:
-                    return {
-                        "exists": True,
-                        "enabled": job.get("enabled", True),
-                        "schedule": job.get("schedule_display", ""),
-                        "next_run_at": job.get("next_run_at", ""),
-                        "last_run_at": job.get("last_run_at", ""),
-                        "last_status": job.get("last_status", ""),
-                        "job_id": job.get("id", ""),
-                    }
-            return {"exists": False}
+    def _tool_recall(self, query: str, memory_type: Optional[str], limit: int) -> str:
+        """Recall relevant memories."""
+        if not query:
+            return "dream_recall requires a query string"
 
-        except Exception as exc:
-            logger.error("Dream cron_status failed: %s", exc)
-            return {"exists": False, "error": str(exc)}
-
-    # -- Config management ---------------------------------------------------
-
-    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
-        """Write config to config.yaml under plugins.dream section.
-
-        Masks consolidate_api_key with '***' before writing to disk.
-        """
-        config_path = Path(hermes_home) / "config.yaml"
+        limit = min(limit, 20)
         try:
-            import yaml
-            existing: dict = {}
-            if config_path.exists():
-                with open(config_path) as f:
-                    existing = yaml.safe_load(f) or {}
-            existing.setdefault("plugins", {})
-            # Mask API key before writing to disk
-            safe_values = dict(values)
-            if safe_values.get("consolidate_api_key") and safe_values["consolidate_api_key"] != "***":
-                safe_values["consolidate_api_key"] = "***"
-            existing["plugins"]["dream"] = safe_values
-            with open(config_path, "w") as f:
-                yaml.dump(existing, f, default_flow_style=False)
-        except Exception as exc:
-            logger.warning("Dream save_config failed: %s", exc)
+            results = self._recall.recall(query, memory_type=memory_type, limit=limit)
+            if not results:
+                return f"No memories found for: {query}"
 
-    def get_config_schema(self) -> List[Dict[str, Any]]:
-        """Return config fields for ``hermes memory setup``."""
-        from hermes_constants import display_hermes_home
-        _default_vault = f"{display_hermes_home()}/dream_vault"
-        return [
-            {
-                "key": "vault_path",
-                "description": "Root directory for dream memory vault",
-                "default": _default_vault,
-            },
-            {
-                "key": "vault_subdir",
-                "description": "Subdirectory within vault_path where dream memories are stored (empty = vault_path itself)",
-                "default": "",
-            },
-            {
-                "key": "max_lines",
-                "description": "Maximum lines per memory document",
-                "default": "100",
-            },
-            {
-                "key": "max_bytes",
-                "description": "Maximum bytes per memory document",
-                "default": "50000",
-            },
-            {
-                "key": "consolidate_model",
-                "description": "LLM model for Phase 4 consolidation (empty = disabled)",
-                "default": "",
-            },
-            {
-                "key": "consolidation_mode",
-                "description": "Consolidation mode: 'deterministic' (default) or 'llm'",
-                "default": "deterministic",
-                "choices": ["deterministic", "llm"],
-            },
-            {
-                "key": "consolidate_api_key",
-                "description": "API key for LLM consolidation (env CONSOLIDATE_API_KEY or OPENROUTER_API_KEY preferred)",
-                "default": "",
-                "secret": True,
-            },
-            {
-                "key": "consolidate_base_url",
-                "description": "API base URL for LLM consolidation (overrides OPENAI_BASE_URL env)",
-                "default": "",
-            },
-            {
-                "key": "consolidate_cron",
-                "description": "Cron schedule for Phase 4 consolidation",
-                "default": "0 3 * * *",
-            },
-            {
-                "key": "taxonomy",
-                "description": "Enable taxonomy-based subdirectories",
-                "default": "true",
-                "choices": ["true", "false"],
-            },
-            {
-                "key": "min_sessions_for_consolidation",
-                "description": "Minimum sessions before consolidation fires (Anthropic default: 5)",
-                "default": "5",
-            },
-            {
-                "key": "auto_recall",
-                "description": "Enable per-turn automatic memory injection from Dream vault",
-                "default": "false",
-                "choices": ["true", "false"],
-            },
-            {
-                "key": "auto_recall_budget",
-                "description": "Max bytes injected per auto-recall turn (default: 2048)",
-                "default": "2048",
-            },
-            {
-                "key": "auto_recall_top_k",
-                "description": "Max memories considered per auto-recall (default: 10)",
-                "default": "10",
-            },
-            {
-                "key": "forgetting_factor_default",
-                "description": "Default forgetting factor (0.005=slow, 0.02=moderate, 0.05=fast decay)",
-                "default": "0.02",
-            },
-            {
-                "key": "prune_retention_threshold",
-                "description": "Retention below which low-importance memories are forgotten (default: 0.1)",
-                "default": "0.1",
-            },
-            {
-                "key": "extraction_mode",
-                "description": "Session-end extraction mode: 'regex' (fast), 'llm' (quality, default), or 'both'",
-                "default": "llm",
-                "choices": ["regex", "llm", "both"],
-            },
-            {
-                "key": "extraction_model",
-                "description": "LLM model for session-end extraction (empty = uses consolidate_model or default)",
-                "default": "",
-            },
-            {
-                "key": "extraction_api_key",
-                "description": "API key for LLM extraction (env EXTRACTION_API_KEY or falls back to consolidate keys)",
-                "default": "",
-                "secret": True,
-            },
-            {
-                "key": "extraction_base_url",
-                "description": "API base URL for LLM extraction (overrides consolidate_base_url and env)",
-                "default": "",
-            },
-        ]
+            lines = [f"## Dream Recall — {len(results)} results for: {query}\n"]
+            for r in results:
+                mem = r.memory
+                content = mem.get("content", "")[:300]
+                lines.append(f"**[{mem.get('type', '?')}]** {mem.get('slug', '?')}")
+                lines.append(content)
+                lines.append(f"_importance: {mem.get('importance', 0):.1f} | created: {mem.get('created', '?')[:10]}_\n")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"dream_recall error: {e}"
+
+    def _tool_consolidate(self) -> str:
+        """Run vault consolidation."""
+        try:
+            from .consolidation import run_consolidation
+            with self._lock:
+                result = run_consolidation(str(self._vault_path), mode="deterministic")
+                lines = ["## Dream Consolidation Results", ""]
+                lines.append(f"Merged: {result.get('merged', 0)}")
+                lines.append(f"Deduped: {result.get('deduped', 0)}")
+                lines.append(f"Pruned: {result.get('pruned', 0)}")
+                lines.append(f"Errors: {result.get('errors', 0)}")
+                return "\n".join(lines)
+        except Exception as e:
+            return f"dream_consolidate error: {e}"
+
+    def _parse_discord_context(self, gateway_session_key: str) -> str:
+        """Extract Discord context from gateway_session_key.
+
+        Formats:
+          agent:main:discord:thread:{parent}:{thread} -> discord:thread:parent:thread
+          agent:main:discord:group:{channel}         -> discord:group:channel
+          agent:main:discord:dm:{user}               -> discord:dm:user
+          agent:main:{platform}:{session}              -> platform:session
+
+        Returns a colon-separated string suitable for use as memory source tag.
+        """
+        if not gateway_session_key:
+            return self._platform or "unknown"
+
+        try:
+            # Split: agent : main : platform : type : ...ids
+            parts = gateway_session_key.split(":")
+            if len(parts) < 3:
+                return gateway_session_key
+
+            platform = parts[2]  # 'discord', 'cli', etc.
+
+            if platform == "discord" and len(parts) >= 5:
+                disc_type = parts[3]  # 'thread', 'group', 'dm'
+                ids = parts[4:]       # contextual IDs
+                return f"discord:{disc_type}:{':'.join(ids)}"
+            elif platform == "discord" and len(parts) == 4:
+                # Edge case: just discord:type without IDs
+                return f"discord:{parts[3]}"
+            else:
+                # Non-Discord: agent:main:cli:default -> cli:default
+                rest = ":".join(parts[2:])
+                return rest
+        except Exception:
+            return gateway_session_key or self._platform or "unknown"
 
 
 # ---------------------------------------------------------------------------
-# Standalone cron helpers (callable from CLI or external tools)
-# ---------------------------------------------------------------------------
-
-
-def setup_consolidation_cron(hermes_home: str = None) -> dict:
-    """Create or update the dream consolidation cron job.
-
-    This is a standalone function that can be called from the CLI, a script,
-    or the cron system itself.  It does not require a DreamMemoryProvider
-    instance.
-
-    Parameters
-    ----------
-    hermes_home:
-        Path to the Hermes home directory.  If *None*, falls back to
-        ``hermes_constants.get_hermes_home()``.
-
-    Returns
-    -------
-    dict
-        The created job dict, or an error dict on failure.
-    """
-    from hermes_constants import get_hermes_home
-
-    if hermes_home is None:
-        hermes_home = str(get_hermes_home())
-
-    provider = DreamMemoryProvider(config=_load_plugin_config())
-    return provider.setup_cron()
-
-
-def remove_consolidation_cron(hermes_home: str = None) -> bool:
-    """Remove the dream consolidation cron job.
-
-    This is a standalone function that can be called from the CLI, a script,
-    or the cron system itself.
-
-    Parameters
-    ----------
-    hermes_home:
-        Path to the Hermes home directory.  If *None*, falls back to
-        ``hermes_constants.get_hermes_home()``.
-
-    Returns
-    -------
-    bool
-        ``True`` if a matching job was found and removed, ``False`` otherwise.
-    """
-    from cron.jobs import list_jobs, remove_job
-
-    removed = False
-    for job in list_jobs(include_disabled=True):
-        if job.get("name") == _DREAM_CRON_JOB_NAME:
-            remove_job(job["id"])
-            removed = True
-    return removed
-
-
-def get_consolidation_cron_status(hermes_home: str = None) -> dict:
-    """Check whether a dream consolidation cron job exists.
-
-    Parameters
-    ----------
-    hermes_home:
-        Path to the Hermes home directory.  Unused but kept for API
-        consistency with the other standalone helpers.
-
-    Returns
-    -------
-    dict
-        Status dict with ``exists``, ``enabled``, ``schedule``, etc.
-    """
-    provider = DreamMemoryProvider(config=_load_plugin_config())
-    return provider.cron_status()
-
-
-# ---------------------------------------------------------------------------
-# Plugin entry point
+# Plugin registration
 # ---------------------------------------------------------------------------
 
 def register(ctx) -> None:
-    """Register the Dream memory provider with the plugin system."""
-    config = _load_plugin_config()
-    provider = DreamMemoryProvider(config=config)
+    """Register this plugin with Hermes."""
+    config = _load_config()
+    provider = DreamV2MemoryProvider(config=config)
     ctx.register_memory_provider(provider)
+    logger.info("[Dream v2] Registered as memory provider")
+
+
+def _load_config() -> dict:
+    """Load dream_v2 config from config.yaml."""
+    try:
+        from hermes_constants import get_hermes_home
+        from pathlib import Path
+        import yaml
+
+        config_path = get_hermes_home() / "config.yaml"
+        if not config_path.exists():
+            return {}
+
+        with open(config_path) as f:
+            all_config = yaml.safe_load(f) or {}
+
+        return all_config.get("plugins", {}).get("dream_v2", {}) or {}
+    except Exception:
+        return {}

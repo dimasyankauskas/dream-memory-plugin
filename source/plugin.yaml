@@ -1,7 +1,58 @@
-name: dream
+name: dream_v2
 version: 0.1.0
-description: "AutoDream-inspired memory consolidation — structured markdown memories with taxonomy, manifest-based recall, and scheduled 4-phase consolidation."
+description: "Dream v2 — Agent Consciousness Memory Provider. Accumulated self-model for continuous agent identity across sessions."
+
 hooks:
+  - on_session_start
   - on_session_end
   - on_pre_compress
-  - on_memory_write
+
+config:
+  vault_path:
+    type: string
+    default: /Users/atma/apps/Garuda_hermes/dream
+    description: Path to the Dream vault directory
+  extraction_model:
+    type: string
+    default: glm-5.1:agentic
+    description: Model for LLM extraction
+  consolidation_model:
+    type: string
+    default: glm-5.1:agentic
+    description: Model for consolidation
+  extraction_mode:
+    type: string
+    default: llm
+    description: Extraction mode — llm or regex
+  hybrid_mode:
+    type: boolean
+    default: true
+    description: Enable session-end + pre-compress rescue extraction
+  max_memories_per_session:
+    type: integer
+    default: 3
+    description: Maximum memories to extract per session
+  significance_threshold:
+    type: float
+    default: 0.7
+    description: Minimum importance score to store a memory
+  max_lines_per_file:
+    type: integer
+    default: 200
+    description: Maximum lines per memory file
+  auto_recall:
+    type: boolean
+    default: false
+    description: Enable auto-recall per turn (disabled — on-demand only)
+  consolidation_mode:
+    type: string
+    default: manual
+    description: Consolidation trigger — manual or cron
+  api_key:
+    type: string
+    default: ""
+    description: API key for extraction (or env var)
+  extraction_base_url:
+    type: string
+    default: ""
+    description: Base URL for extraction API (default: localhost:11434)
