@@ -22,8 +22,8 @@ import sys
 from pathlib import Path
 
 
-V1_VAULT = Path("/Users/atma/apps/Garuda_hermes/ObsidianVault/dream")
-V2_VAULT = Path("/Users/atma/apps/Garuda_hermes/dream")
+V1_VAULT = Path(os.environ.get("DREAM_V1_VAULT", ""))
+V2_VAULT = Path(os.environ.get("DREAM_V2_VAULT", ""))
 MAX_LINES = 200
 MAX_WIKILINKS = 5
 
@@ -185,24 +185,38 @@ def render_frontmatter(meta: dict) -> str:
     return "\n".join(lines)
 
 
-def main(dry_run: bool = False):
+def parse_args():
+    """Parse command-line arguments."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Dream v2 migration script")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be migrated without migrating")
+    parser.add_argument("--source", type=str, default="", help="Path to v1 vault (or set DREAM_V1_VAULT env var)")
+    parser.add_argument("--dest", type=str, default="", help="Path to v2 vault (or set DREAM_V2_VAULT env var)")
+    return parser.parse_args()
+
+
+def main(args):
+    source = Path(args.source) if args.source else V1_VAULT
+    dest = Path(args.dest) if args.dest else V2_VAULT
+    dry_run = args.dry_run
+
     print(f"{'[DRY RUN] ' if dry_run else ''}Dream v2 Migration")
-    print(f"  Source: {V1_VAULT}")
-    print(f"  Dest:   {V2_VAULT}")
+    print(f"  Source: {source}")
+    print(f"  Dest:   {dest}")
     print()
 
-    if not V1_VAULT.exists():
-        print(f"ERROR: Source vault not found: {V1_VAULT}")
+    if not source.exists():
+        print(f"ERROR: Source vault not found: {source}")
         sys.exit(1)
 
     if not dry_run:
-        V2_VAULT.mkdir(parents=True, exist_ok=True)
+        dest.mkdir(parents=True, exist_ok=True)
         for subdir in ["consciousness/self", "consciousness/relationship", "consciousness/work",
                        "decisions", "feedback", "reference", "sessions"]:
-            (V2_VAULT / subdir).mkdir(parents=True, exist_ok=True)
+            (dest / subdir).mkdir(parents=True, exist_ok=True)
 
     # Load v1 manifest
-    manifest_path = V1_VAULT / "manifest.json"
+    manifest_path = source / "manifest.json"
     if manifest_path.exists():
         with open(manifest_path) as f:
             manifest = json.load(f)
@@ -219,7 +233,7 @@ def main(dry_run: bool = False):
 
     # Migrate by type directories
     for mem_type in ["user", "feedback", "project", "reference", "proposal"]:
-        type_dir = V1_VAULT / mem_type
+        type_dir = source / mem_type
         if not type_dir.exists():
             continue
 
@@ -239,7 +253,7 @@ def main(dry_run: bool = False):
                     print(f"  SKIP {v1_file.name}: {reason}")
                     skipped += 1
             else:
-                if migrate_memory(v1_file, V2_VAULT, mem_type):
+                if migrate_memory(v1_file, dest, mem_type):
                     migrated += 1
                 else:
                     skipped += 1
@@ -255,5 +269,5 @@ def main(dry_run: bool = False):
 
 
 if __name__ == "__main__":
-    dry_run = "--dry-run" in sys.argv
-    main(dry_run=dry_run)
+    args = parse_args()
+    main(args)

@@ -80,7 +80,7 @@ memory:
 
 plugins:
   dream_v2:
-    vault_path: /Users/atma/apps/Garuda_hermes/dream
+    vault_path: ~/dream
     extraction_model: glm-5.1:agentic
     extraction_mode: llm
     hybrid_mode: true

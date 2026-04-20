@@ -36,7 +36,7 @@ def load_dream_v2_config() -> dict:
     dream_config.setdefault("max_lines_per_file", 200)
     dream_config.setdefault("auto_recall", False)
     dream_config.setdefault("consolidation_mode", "manual")
-    dream_config.setdefault("vault_path", "/Users/atma/apps/Garuda_hermes/dream")
+    dream_config.setdefault("vault_path", "")  # resolved at runtime via resolve_vault_path()
 
     return dream_config
 

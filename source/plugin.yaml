@@ -10,7 +10,7 @@ hooks:
 config:
   vault_path:
     type: string
-    default: /Users/atma/apps/Garuda_hermes/dream
+    default: ""
     description: Path to the Dream vault directory
   extraction_model:
     type: string
