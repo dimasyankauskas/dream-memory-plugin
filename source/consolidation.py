@@ -740,143 +740,6 @@ def gather(store: DreamStore, orient_result: OrientResult, memory_type: Optional
 
 
 # ---------------------------------------------------------------------------
-# Wikilink insertion helpers (Heartbeat 5)
-# ---------------------------------------------------------------------------
-
-
-def _add_wikilinks_to_merged_content(merged_content: str, source_entries: List, store=None) -> str:
-    """Add [[wikilinks]] to merged memory content pointing to original sources."""
-    from .store import slug_from_filename, make_wikilink
-
-    links = []
-    for entry in source_entries:
-        filename = getattr(entry, "filename", "") if not isinstance(entry, dict) else entry.get("filename", "")
-        mem_type = getattr(entry, "memory_type", "") if not isinstance(entry, dict) else entry.get("type", "")
-        slug = slug_from_filename(filename)
-        if slug:
-            links.append(make_wikilink(mem_type, slug))
-
-    if not links:
-        return merged_content
-
-    # Don't add if already has wikilinks
-    if "## Related" in merged_content or "[[" in merged_content:
-        return merged_content
-
-    link_line = "## Related\n" + " ".join(links)
-    return merged_content.rstrip() + "\n\n" + link_line + "\n"
-
-
-def _add_bidirectional_wikilinks(entries_in_group: List, store, max_links: int = 5) -> None:
-    """Add bidirectional [[wikilinks]] between memories in the same consolidation group.
-
-    Args:
-        entries_in_group: Memories in the same consolidation group.
-        store: DreamStore instance.
-        max_links: Maximum wikilinks per memory (default 5). Prevents wikilink explosion.
-    """
-    from .store import slug_from_filename, make_wikilink
-
-    if len(entries_in_group) < 2:
-        return
-
-    for i, entry in enumerate(entries_in_group):
-        filename_i = getattr(entry, "filename", "") if not isinstance(entry, dict) else entry.get("filename", "")
-        type_i = getattr(entry, "memory_type", "") if not isinstance(entry, dict) else entry.get("type", "")
-
-        other_links = []
-        for j, other in enumerate(entries_in_group):
-            if i == j:
-                continue
-            if len(other_links) >= max_links:
-                break  # Cap reached
-            filename_j = getattr(other, "filename", "") if not isinstance(other, dict) else other.get("filename", "")
-            type_j = getattr(other, "memory_type", "") if not isinstance(other, dict) else other.get("type", "")
-
-            slug = slug_from_filename(filename_j)
-            if slug:
-                other_links.append(make_wikilink(type_j, slug))
-
-        if other_links:
-            try:
-                data = store.read_memory(type_i, filename_i)
-                content = data.get("body", "") if isinstance(data, dict) else str(data)
-                if content and "## Related" not in content and "[[" not in content:
-                    updated = content.rstrip() + "\n\n## Related\n" + " ".join(other_links) + "\n"
-                    store.update_memory(type_i, filename_i, content=updated)
-            except Exception:
-                pass
-
-
-def _add_cross_group_wikilinks(
-    store: DreamStore,
-    gather_result: "GatherResult",
-    consolidate_result: "ConsolidateResult",
-) -> None:
-    """Add [[wikilinks]] from merged memories to other surviving memories with overlapping tags.
-
-    After consolidation, merged memories may contain content from several sources
-    but lack wikilinks to related surviving memories outside their group. This
-    function scans all remaining vault memories, finds tag overlaps, and adds
-    ``## Related`` sections with wikilinks to related memories.
-    """
-    from .store import slug_from_filename, make_wikilink
-
-    # Reload the vault to get current state after pruning
-    all_memories = store.list_memories()
-    if len(all_memories) < 2:
-        return
-
-    # Build a tag -> memory mapping
-    tag_to_memories: Dict[str, List[Dict]] = {}
-    for mem in all_memories:
-        for tag in mem.get("meta", {}).get("tags", []):
-            tag_to_memories.setdefault(tag, []).append(mem)
-
-    # For each memory, find related memories via shared tags
-    for mem in all_memories:
-        mem_type = mem.get("type", "")
-        filename = mem.get("filename", "")
-        tags = set(t.lower() for t in mem.get("meta", {}).get("tags", []))
-
-        if not tags:
-            continue
-
-        # Collect related memories (those sharing at least 1 tag)
-        related_links = []
-        related_keys = set()
-        for tag in tags:
-            for related_mem in tag_to_memories.get(tag, []):
-                r_type = related_mem.get("type", "")
-                r_filename = related_mem.get("filename", "")
-                r_key = f"{r_type}/{r_filename}"
-                # Skip self
-                if r_type == mem_type and r_filename == filename:
-                    continue
-                if r_key in related_keys:
-                    continue
-                related_keys.add(r_key)
-
-                slug = slug_from_filename(r_filename)
-                if slug:
-                    related_links.append(make_wikilink(r_type, slug))
-
-        if not related_links:
-            continue
-
-        # Only add if memory doesn't already have a Related section or wikilinks
-        try:
-            data = store.read_memory(mem_type, filename)
-            content = data.get("body", "")
-            if content and "## Related" not in content and "[[" not in content:
-                updated = content.rstrip() + "\n\n## Related\n" + " ".join(related_links) + "\n"
-                store.update_memory(mem_type, filename, content=updated)
-                logger.debug("Cross-group wikilinks added to %s/%s", mem_type, filename)
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
 # Phase 3: Consolidate
 # ---------------------------------------------------------------------------
 
@@ -938,26 +801,10 @@ def consolidate(
         keep_entry = sorted_entries[-1]
         other_files = [f"{e.memory_type}:{e.filename}" for e in sorted_entries[:-1]]
 
-        # Build wikilinks only for entries that will survive consolidation.
-        # Entries that will be superseded (deleted) should not be linked,
-        # as that would create dangling wikilinks after pruning.
-        # For a full-group merge, only the keep_entry survives, but linking
-        # to oneself is not useful — so we skip wikilinks when all sources
-        # are being merged away.
-        surviving_source_entries = [e for e in group.entries
-                                    if e is keep_entry]
-        if surviving_source_entries and len(surviving_source_entries) < len(group.entries):
-            # Only the keep_entry survives; a self-wikilink is pointless.
-            # We'll add cross-group wikilinks later in run_consolidation
-            # via _add_bidirectional_wikilinks for related surviving memories.
-            wikilinked_content = merged_content
-        else:
-            wikilinked_content = _add_wikilinks_to_merged_content(merged_content, surviving_source_entries, store)
-
         merges.append({
             "memory_type": keep_entry.memory_type,
             "filename": keep_entry.filename,
-            "content": wikilinked_content,
+            "content": merged_content,
             "tags": sorted(merged_tags),
             "relevance": min(1.0, highest_relevance + 0.05),
         })
@@ -1971,27 +1818,6 @@ def run_consolidation(
             # Reset session counter after successful consolidation
             if prune_result.manifest_updated:
                 store.reset_session_counter()
-
-            # Add bidirectional wikilinks for non-merged group members (capped at 5 per memory)
-            # Cross-group wikilinks removed: caused exponential Related sections (80+ links/file)
-            merged_keys = set()
-            for merge_info in consolidate_result.merges:
-                merged_keys.add(f"{merge_info.get('memory_type', '')}:{merge_info.get('filename', '')}")
-            for superseded_key in consolidate_result.superseded:
-                merged_keys.add(superseded_key)
-
-            for group in gather_result.groups:
-                if len(group.entries) < 2:
-                    continue
-                all_merged = all(
-                    f"{e.memory_type}:{e.filename}" in merged_keys
-                    for e in group.entries
-                )
-                if not all_merged:
-                    try:
-                        _add_bidirectional_wikilinks(group.entries, store, max_links=5)
-                    except Exception as exc:
-                        logger.debug("Bidirectional wikilinks failed for group %s: %s", group.group_id, exc)
 
         return full_result
     finally:
