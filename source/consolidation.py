@@ -767,8 +767,14 @@ def _add_wikilinks_to_merged_content(merged_content: str, source_entries: List, 
     return merged_content.rstrip() + "\n\n" + link_line + "\n"
 
 
-def _add_bidirectional_wikilinks(entries_in_group: List, store) -> None:
-    """Add bidirectional [[wikilinks]] between memories in the same consolidation group."""
+def _add_bidirectional_wikilinks(entries_in_group: List, store, max_links: int = 5) -> None:
+    """Add bidirectional [[wikilinks]] between memories in the same consolidation group.
+
+    Args:
+        entries_in_group: Memories in the same consolidation group.
+        store: DreamStore instance.
+        max_links: Maximum wikilinks per memory (default 5). Prevents wikilink explosion.
+    """
     from .store import slug_from_filename, make_wikilink
 
     if len(entries_in_group) < 2:
@@ -782,6 +788,8 @@ def _add_bidirectional_wikilinks(entries_in_group: List, store) -> None:
         for j, other in enumerate(entries_in_group):
             if i == j:
                 continue
+            if len(other_links) >= max_links:
+                break  # Cap reached
             filename_j = getattr(other, "filename", "") if not isinstance(other, dict) else other.get("filename", "")
             type_j = getattr(other, "memory_type", "") if not isinstance(other, dict) else other.get("type", "")
 
@@ -1654,6 +1662,7 @@ def prune(
     result = PruneResult()
 
     # --- Delete superseded files ---
+    delete_skipped = 0
     for superseded_key in consolidate_result.superseded:
         parts = superseded_key.split(":", 1)
         if len(parts) != 2:
@@ -1664,10 +1673,17 @@ def prune(
                 deleted = store.delete_memory(mem_type, filename)
                 if deleted:
                     result.deleted_files.append(superseded_key)
+                else:
+                    # File already gone — likely deduplicated earlier in this run
+                    delete_skipped += 1
+                    logger.debug("Prune: skip delete %s — already gone", superseded_key)
             except Exception as exc:
                 logger.warning("Prune: failed to delete %s: %s", superseded_key, exc)
         else:
             result.deleted_files.append(f"[dry-run] {superseded_key}")
+
+    if delete_skipped > 0:
+        logger.info("Prune: %d files already deleted (likely deduped earlier in run)", delete_skipped)
 
     # --- Apply merges (update merged content) ---
     for merge_info in consolidate_result.merges:
@@ -1956,11 +1972,10 @@ def run_consolidation(
             if prune_result.manifest_updated:
                 store.reset_session_counter()
 
-            # Add bidirectional wikilinks for non-merged group members
-            # (groups where entries were kept separate rather than merged)
+            # Add bidirectional wikilinks for non-merged group members (capped at 5 per memory)
+            # Cross-group wikilinks removed: caused exponential Related sections (80+ links/file)
             merged_keys = set()
             for merge_info in consolidate_result.merges:
-                # Track which files are merge targets (kept files)
                 merged_keys.add(f"{merge_info.get('memory_type', '')}:{merge_info.get('filename', '')}")
             for superseded_key in consolidate_result.superseded:
                 merged_keys.add(superseded_key)
@@ -1968,24 +1983,15 @@ def run_consolidation(
             for group in gather_result.groups:
                 if len(group.entries) < 2:
                     continue
-                # Check if this group was merged (all entries are in merged/superseded)
                 all_merged = all(
                     f"{e.memory_type}:{e.filename}" in merged_keys
                     for e in group.entries
                 )
                 if not all_merged:
-                    # Non-merged group — add bidirectional wikilinks
                     try:
-                        _add_bidirectional_wikilinks(group.entries, store)
+                        _add_bidirectional_wikilinks(group.entries, store, max_links=5)
                     except Exception as exc:
                         logger.debug("Bidirectional wikilinks failed for group %s: %s", group.group_id, exc)
-
-            # Add cross-group wikilinks: link surviving memories that share
-            # tags (especially merged memories that absorbed group content).
-            try:
-                _add_cross_group_wikilinks(store, gather_result, consolidate_result)
-            except Exception as exc:
-                logger.debug("Cross-group wikilinks failed: %s", exc)
 
         return full_result
     finally:

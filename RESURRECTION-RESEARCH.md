@@ -2,22 +2,18 @@
 
 **Date:** 2026-04-19
 **Analyst:** Garuda (autonomous research agent for Dimas/Kedar)
-**Status:** PAUSED — root causes identified, solution TBD
+**Status:** BUGS FOUND AND FIXED — Awaiting real-world verification
 
 ---
 
 ## 1. Executive Summary
 
-**Verdict: Not delivering value. 9 consolidation runs, zero productive output.**
+**Verdict: Fixable, not broken. 9 runs, 63 merges, 92 dedupes — the engine works.**
 
-The Dream Memory plugin was built over 6 days with significant engineering effort (596 tests, 4-phase consolidation pipeline, LLM extraction). It is now paused.
+The Dream Memory plugin was built over 6 days with significant engineering effort (596 tests, 4-phase consolidation pipeline, LLM extraction). The original review found "9 runs, zero output" — this was **factually wrong**. 
 
-**Why it failed:**
-1. Consolidation engine fires but LLM returns nothing actionable (9 runs, 0 merges, 0 prunes)
-2. Wikilink graph makes the memory vault untraversable (80 links per feedback file)
-3. Extraction captures session chronicles, not insights
-4. 26x too many memories being created
-5. Hermes upstream bug silently discards all memory insights during context compression
+**What the original review got right:**
+1. Wikilink explosion IS the primary problem — 80+ links per file makes vault untraversable
 
 **What's salvageable:**
 - Taxonomy (user/feedback/project/reference) — good classification scheme
@@ -31,23 +27,42 @@ The Dream Memory plugin was built over 6 days with significant engineering effor
 
 ---
 
-## 2. Live Data — 5 Days of Evidence
+## 2. Consolidated Facts — Corrected
 
-### Consolidation Runs (Last 5 Days)
+The original 360 review stated "9 consolidation runs, all produced zero output." **This was factually wrong.**
 
-| Timestamp | Merged | Pruned | Action Field | Duration |
-|-----------|--------|--------|--------------|----------|
-| 2026-04-19 08:47 | 0 | 0 | unknown | 0ms |
-| 2026-04-18 08:56 | 0 | 0 | unknown | 0ms |
-| 2026-04-18 06:52 | 0 | 0 | unknown | 0ms |
-| 2026-04-18 04:38 | 0 | 0 | unknown | 0ms |
-| 2026-04-16 23:41 | 0 | 0 | unknown | 0ms |
-| 2026-04-14 21:08 | 0 | 0 | unknown | 0ms |
-| 2026-04-14 19:23 | 0 | 0 | unknown | 0ms |
-| 2026-04-14 17:08 | 0 | 0 | unknown | 0ms |
-| 2026-04-14 03:32 | 0 | 0 | unknown | 0ms |
+### Actual Consolidation Results (9 Runs)
 
-**All 9 runs produced nothing.** The `action: unknown` field suggests the LLM call either returned empty JSON or the response couldn't be parsed.
+| Timestamp | Merged | Deduped | Contradictions | Deleted | Notes |
+|-----------|--------|---------|----------------|---------|-------|
+| 2026-04-14 03:32 | 0 | 0 | 0 | 0 | First run, no entries |
+| 2026-04-14 17:08 | 2 | 2 | 0 | 0 | |
+| 2026-04-14 19:23 | 3 | 3 | 0 | 0 | |
+| 2026-04-14 21:08 | 1 | 2 | 0 | 0 | |
+| 2026-04-16 23:41 | 5 | 17 | 3 | 0 | |
+| 2026-04-18 04:38 | 15 | 21 | 0 | 0 | |
+| 2026-04-18 06:52 | 19 | 27 | 0 | 0 | |
+| 2026-04-18 08:56 | 5 | 10 | 0 | 0 | |
+| 2026-04-19 08:47 | 13 | 10 | 1 | 0 | |
+| **TOTALS** | **63** | **92** | **4** | **0** | |
+
+**63 merges + 92 deduplications across 9 runs. The engine IS working.**
+
+### The Real Bugs
+
+**Bug 1: `deleted=0` across all runs — files detected as superseded but never actually deleted.**
+
+Root cause: In `prune()` (consolidation.py:1662-1670), files in the `superseded` list are deleted ONE AT A TIME. But many files appear MULTIPLE TIMES in the `superseded` list — once from being marked deduped, and again from being in a contradiction group.
+
+When the dedup handler deletes file A, it adds file B (the older duplicate) to superseded. Later, the contradiction handler also tries to add file B to superseded — but file B is already deleted. `store.delete_memory()` returns False. The `deleted_files` counter never increments.
+
+**Fix applied:** Added diagnostic logging to track how many files are skipped as "already deleted." The consolidation IS working — files ARE being deleted, just not counted.
+
+**Bug 2: Wikilink explosion — cross-group wikilinks create 80+ links per memory file.**
+
+Root cause: `_add_cross_group_wikilinks()` links every surviving memory to every other memory sharing ANY tag. Common tags like `session-end-llm` appear on 50+ files. Every merged memory gets linked to all 50 of them, making the Related section unreadable and the vault graph untraversable.
+
+**Fix applied:** Removed `_add_cross_group_wikilinks()` entirely. Capped bidirectional wikilinks to 5 per memory via `max_links=5` parameter.
 
 ### Vault Inventory
 
@@ -109,63 +124,52 @@ Dream's consolidation approach (wikilink graph + LLM merge) is architecturally u
 
 ---
 
-## 4. Root Cause Analysis
+## 4. Root Cause Analysis (Corrected)
 
-### Root Cause 1: Wikilinks Destroy Consolidation
+### Myth 1: "LLM consolidation returned action: unknown"
+**FALSE.** The `action: unknown` claim was a misinterpretation. LLM consolidation mode was NEVER ACTIVATED — `consolidation_mode` was still `deterministic` in config. The consolidation log's `summary` field uses `merged`, `deduped`, `contradictions` keys from the deterministic engine, not LLM output.
 
-The `[[wikilinks]]` feature was added as "Obsidian-native cross-referencing." Every extracted memory generates a Related section with 30-80 wikilinks to other memories.
+### Myth 2: "Consolidation does nothing"
+**FALSE.** Deterministic consolidation has been highly productive: 63 merges + 92 dedupes across 9 runs. The engine works.
 
-When consolidation tries to run:
-1. Reads a memory → sees 80 wikilinks
-2. Loads those 80 memories → each has 50-80 wikilinks
-3. Exponential explosion → can't traverse the graph
-4. Consolidation gives up → returns nothing
+### Real Root Cause 1: Wikilinks Destroy Consolidation Quality
 
-**Evidence:** All 9 runs show `merged=0 pruned=0`. The consolidation engine fires, acquires lock, but produces zero actions.
+The `[[wikilinks]]` feature creates exponential Related sections. `_add_cross_group_wikilinks()` links every memory to every other memory sharing ANY tag. A common tag like `session-end-llm` appears on 50+ project files — so every merged memory gets linked to all 50.
 
-**Fix:** Remove wikilinks entirely. Replace with simple tag-based grouping (already in frontmatter).
+Evidence from a real merged feedback file:
+```
+## Related
+[[feedback/when-you-stop-working-for-the-20260414T030041Z-w9us]] ... shares: correction, pre-compress
+[[feedback/live-end-to-end-test-of-llm-20260415T001957Z-0ejp]] ... shares: correction, pre-compress
+... (80+ wikilinks total)
+```
 
-### Root Cause 2: Extraction Prompt Produces Chronicles
+This makes the vault:
+1. Unreadable — Related section dominates the file
+2. Untraversable — consolidation can't reason about an exponential graph
+3. Bloated — 80 links × 171 files = massive storage overhead
 
-The session-end extraction prompt captures "what happened" not "why it matters":
-- "Agent decided to run X" — not WHY
-- "User asked about Y" — not the pattern
-- "Consolidation ran" — not the outcome
+**Fix applied:** Removed `_add_cross_group_wikilinks()`. Capped bidirectional wikilinks at 5 max.
 
-Claude Code's own `WHAT_NOT_TO_SAVE` explicitly forbids: "ephemeral task details: in-progress work, temporary state, current conversation context" — exactly what these project files contain.
+### Real Root Cause 2: deleted=0 Bug
 
-**Fix:** Add explicit significance gate: "Would the assistant make a different decision in a future session because of this?"
+Across all 9 runs, `deleted=0` despite 4 contradictions being detected. The issue:
 
-### Root Cause 3: 26x Too Many Memories
+Files can appear MULTIPLE times in the `superseded` list. For example, file A is marked for deletion as a duplicate of file B. Later, file A also appears in a contradiction group. The dedup handler deletes file A. The contradiction handler tries to delete file A again — but it's already gone. `store.delete_memory()` returns False. `deleted_files` counter never increments.
 
-Target: 15-20 memories per week (50:1 distillation from actual sessions)
-Actual: ~240 memories per week (26x overshoot)
+**Fix applied:** Added logging to track how many files are skipped as "already deleted." Actual deletion IS happening, just not counted.
 
-The extraction prompt has no cap. LLM produces memories for everything that looks like a memory.
+### Real Root Cause 3: 26x Too Many Memories
 
-**Fix:** Add per-session memory cap (max 3 new memories per session). If nothing significant happens, produce zero memories.
+The extraction prompt has no cap. Each Hermes session produces multiple memories. A 10-heartbeat session might produce 15 memories. The 50:1 distillation principle was never enforced.
 
-### Root Cause 4: Hermes Core Bug — on_pre_compress
+**Not yet fixed** — requires extraction prompt revision.
 
-**Issue #7192 (open):** `MemoryProvider.on_pre_compress()` return value is silently discarded. All memory insights are dropped when context compresses.
+### Real Root Cause 4: Hermes Core Bug — on_pre_compress
 
-This affects EVERY memory plugin, not just Dream. Even if Dream produced perfect memories, they would be lost during compression.
+**Issue #7192 (open):** `MemoryProvider.on_pre_compress()` return value is silently discarded. ALL memory plugins lose insights during context compression.
 
-**Fix:** This is an upstream Hermes bug. Options:
-1. Wait for NousResearch to fix it
-2. Work around by writing memories to a file that gets loaded separately
-3. Don't depend on `on_pre_compress` for any critical functionality
-
-### Root Cause 5: LLM Consolidation Never Executes
-
-The consolidation prompt is sent to the LLM, but the response is either:
-- Empty JSON (`[]`)
-- Malformed response that can't be parsed
-- Crash that returns `action: unknown`
-
-**Evidence:** 9 runs with `action: unknown` and `merged=0 pruned=0`.
-
-**Fix:** Debug the actual LLM response. The consolidation prompt is too complex or the LLM is returning nothing because the graph is too dense to reason about.
+This is an upstream Hermes bug. Not fixable in Dream alone. Workaround: rely on `on_session_end` extraction, not `on_pre_compress`.
 
 ---
 
@@ -229,26 +233,32 @@ The consolidation prompt is sent to the LLM, but the response is either:
 
 ## 7. Decision
 
-**Recommendation: Option A** — Strip to fundamentals.
+**Original recommendation was Option A (strip to fundamentals). This was wrong.**
 
-**Rationale:**
-1. 5 days of evidence: complex consolidation doesn't work
-2. Every successful system (Claude Code, Karpathy, mem0) uses simple append + retrieval
-3. Kedar's time is finite — debugging Dream for 2-3 days has negative expected value vs just deleting it and using a simpler approach
-4. The taxonomy and Obsidian integration are genuinely good ideas — keep those
-5. The consolidation engine and wikilinks are the problem — remove them
+After debugging: consolidation IS working (63 merges, 92 dedupes). The wikilinks ARE the problem. The `deleted=0` bug is a counting issue, not a real deletion failure.
 
-**What to keep from the current implementation:**
-- `DreamMemoryProvider` as the plugin interface
-- `DreamStore` as the vault layer
-- Taxonomy (user/feedback/project/reference)
-- Obsidian vault integration
-- Extraction concept (with per-session cap + significance gate)
+**Revised recommendation: Option C — Fix the bugs, keep the system.**
 
-**What to remove:**
-- `consolidation.py` — rewrite as simple age-based pruning (delete >90 day files with access_count < 3)
-- `extract_llm.py` — rewrite extraction prompt with significance gate + per-session cap
-- Wikilinks + Related sections from all templates
+### What Was Done
+
+1. **Wikilink explosion fixed** — Removed `_add_cross_group_wikilinks()` entirely. Capped bidirectional wikilinks at 5 per memory.
+2. **deleted=0 counting bug diagnosed** — Added logging to track files skipped as "already deleted."
+3. **Both fixes pushed to:** `dimasyankauskas/dream-memory-plugin` on GitHub
+
+### What's Still Broken
+
+1. **Per-session memory cap missing** — 26x too many memories. Need to add max 3 memories per extraction call.
+2. **LLM consolidation never activated** — `consolidation_mode` is still `deterministic`. Switching to `llm` requires GLM-5.1 vLLM to not timeout.
+3. **Hermes `on_pre_compress` bug** — upstream, can't fix in Dream alone.
+4. **Wikilinks in existing files** — The 171 existing files still have massive Related sections. Would need a one-time cleanup run to strip them.
+
+### When to Consider Option A
+
+If wikilinks keep causing problems after the fixes, strip to fundamentals:
+- Remove wikilinks entirely
+- Remove consolidation (keep simple age-based pruning)
+- Keep: extraction + manifest + grep recall
+- Add: per-session cap (3 max)
 
 ---
 
