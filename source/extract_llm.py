@@ -44,6 +44,7 @@ class LLMExtractor:
         timeout: int = 120,
     ):
         self.model = model
+        self.api_key = api_key
         self.base_url = base_url or DEFAULT_BASE_URL
         self.timeout = timeout
         self._client: Optional[Any] = None
@@ -55,7 +56,7 @@ class LLMExtractor:
                 import openai
                 self._client = openai.OpenAI(
                     base_url=self.base_url,
-                    api_key=api_key or "ollama",
+                    api_key=self.api_key or "ollama",
                     timeout=self.timeout,
                 )
             except ImportError:
