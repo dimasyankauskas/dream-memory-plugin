@@ -65,6 +65,40 @@ def run_consolidation(vault_path: str, mode: str = "deterministic") -> Dict[str,
                         deleted_filenames.add(entry.get("filename", ""))
                         stats["deduped"] += 1
 
+        
+        # Phase 3.5: Fuzzy Content Deduplication (Prevent vault bloat deterministically)
+        # Pruning older memories if their core body text is >85% similar to a newer memory.
+        import difflib
+        similarity_threshold = 0.85
+        type_groups = defaultdict(list)
+        for entry in manifest:
+            if entry.get("filename") not in deleted_filenames:
+                type_groups[entry.get("type", "")].append(entry)
+                
+        for mem_type, entries in type_groups.items():
+            sorted_by_newest = sorted(entries, key=lambda x: x.get("created", ""), reverse=True)
+            for i, newer_entry in enumerate(sorted_by_newest):
+                newer_content = _read_memory_content(vault, newer_entry)
+                if not newer_content: continue
+                
+                for older_entry in sorted_by_newest[i+1:]:
+                    if older_entry.get("filename") in deleted_filenames: continue
+                    older_content = _read_memory_content(vault, older_entry)
+                    if not older_content: continue
+                    
+                    # Fuzzy match on the actual learned content
+                    if older_content in newer_content:
+                        similarity = 1.0
+                    else:
+                        matcher = difflib.SequenceMatcher(None, newer_content, older_content)
+                        similarity = matcher.quick_ratio()
+                    
+                    if similarity >= similarity_threshold:
+                        # Older memory is highly redundant textually, prune
+                        if _delete_memory(vault, manifest, older_entry):
+                            deleted_filenames.add(older_entry.get("filename", ""))
+                            stats["pruned"] += 1
+
         # Phase 4: Size enforcement — cap files at max_lines
         max_lines = 200
         for entry in manifest:
