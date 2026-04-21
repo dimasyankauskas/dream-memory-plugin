@@ -909,7 +909,7 @@ class TestRealisticLLMOutput:
                 },
                 {
                     "type": "reference",
-                    "content": "Obsidian vault is at ~/apps/Garuda_hermes/ObsidianVault/",
+                    "content": "Dream plugin default vault_path resolves to ~/.hermes/dream_v2",
                     "tags": ["path"],
                     "relevance": 0.4,
                 },
